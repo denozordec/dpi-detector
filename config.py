@@ -8,18 +8,16 @@ MAX_CONCURRENT = 70
 
 # === Таймауты ===
 TIMEOUT = 7.0
-TIMEOUT_TCP_16_20 = 12.0
+TIMEOUT_TCP_16_20 = 10.0
 
 # === Повторные попытки ===
 DOMAIN_CHECK_RETRIES = 1
 TCP_16_20_CHECK_RETRIES = 1
 
-# разница между тестами при DOMAIN_CHECK_RETRIES = 2 для обнаружения балансировщика у провайдера
-DPI_VARIANCE_THRESHOLD = 10  # %
-
 # === TCP блокировка ===
 TCP_BLOCK_MIN_KB = 1
 TCP_BLOCK_MAX_KB = 69
+FAT_DEFAULT_SNI = "example.com"
 
 # === Отображение ===
 SHOW_DATA_SIZE = False
@@ -54,7 +52,7 @@ WSAEACCES = 10013
 
 # === DNS проверка ===
 DNS_CHECK_ENABLED = True
-DNS_CHECK_TIMEOUT = 3.0
+DNS_CHECK_TIMEOUT = 5.0
 DNS_CHECK_DOMAINS = [
     "rutor.info",
     "ej.ru",
@@ -62,13 +60,14 @@ DNS_CHECK_DOMAINS = [
     "clubtone.do.am",
     "rezka.ag",
     "shikimori.one",
+    "youtube.com"
 ]
 
 DNS_UDP_SERVERS = [
     ("8.8.8.8",        "Google"),
-    ("11.1.1.1",       "Cloudflare"),
-    ("19.9.9.9",       "Quad9"),
-    ("194.140.14.14",  "AdGuard"),
+    ("1.1.1.1",        "Cloudflare"),
+    ("9.9.9.9",        "Quad9"),
+    ("94.140.14.14",   "AdGuard"),
     ("77.88.8.8",      "Yandex"),
     ("223.5.5.5",      "Alibaba"),
     ("208.67.222.222", "OpenDNS"),    # Cisco
@@ -76,11 +75,10 @@ DNS_UDP_SERVERS = [
     ("194.242.2.2",    "Mullvad"),
 ]
 
-# Формат: (URL, "Название")
 DNS_DOH_SERVERS = [
-   ("https://8.8.8.8/resolve",              "Google (IP)"),
+   ("https://8.8.8.8/resolve",              "Google"),
    ("https://dns.google/resolve",           "Google"),
-   ("https://1.1.1.1/dns-query",            "Cloudflare (IP)"),
+   ("https://1.1.1.1/dns-query",            "Cloudflare"),
    ("https://cloudflare-dns.com/dns-query", "Cloudflare"),
    ("https://one.one.one.one/dns-query",    "Cloudflare"),
    ("https://dns.adguard-dns.com/resolve",  "AdGuard"),
