@@ -22,7 +22,7 @@ from cli.runners import run_domains_test, run_tcp_test
 from core.dns_scanner import check_dns_integrity, collect_stub_ips_silently
 from utils.files import load_domains, load_tcp_targets, get_exe_dir
 
-CURRENT_VERSION = "1.4"
+CURRENT_VERSION = "2.0"
 GITHUB_REPO     = "Runnin4ik/dpi-detector"
 
 DOMAINS         = load_domains()
@@ -91,7 +91,7 @@ def _format_summary(
         elif dns_intercept == total_dns:
             lines.append(
                 f"[bold]DNS[/bold]          "
-                f"[bold red]× {dns_intercept}/{total_dns}  подменяется провайдером[/bold red]"
+                f"[red]× {dns_intercept}/{total_dns}  подменяется провайдером[/red]"
             )
         else:
             lines.append(
@@ -106,9 +106,9 @@ def _format_summary(
         line = (
             f"[bold]Домены[/bold]       "
             f"[green]√ {d['ok']}/{d['total']} OK[/green]"
-            + (f"  [red]× {d['blocked']} заблок.[/red]" if d['blocked'] else "")
+            + (f"  [red]× {d['blocked']} блок.[/red]" if d['blocked'] else "")
             + (f"  [yellow]⏱ {d['timeout']} таймаут[/yellow]" if d['timeout'] else "")
-            + f"  [dim]({pct}%)[/dim]"
+            + f"  [dim]({pct}% ОК)[/dim]"
         )
         lines.append(line)
 
@@ -120,30 +120,33 @@ def _format_summary(
             f"[green]√ {t['ok']}/{t['total']} OK[/green]"
             + (f"  [red]× {t['blocked']} блок.[/red]" if t['blocked'] else "")
             + (f"  [yellow]≈ {t['mixed']} смеш.[/yellow]" if t['mixed'] else "")
-            + f"  [dim]({pct}%)[/dim]"
+            + f"  [dim]({pct}% ОК)[/dim]"
         )
         lines.append(line)
 
     return lines
 
 
+def is_newer(latest: str, current: str) -> bool:
+    """Сравнивает версии. Возвращает True, если на GitHub версия выше текущей."""
+    try:
+        def parse(v):
+            return tuple(int(x) for x in v.replace('v', '').split('.') if x.isdigit())
+
+        l_parts = parse(latest)
+        c_parts = parse(current)
+        return l_parts > c_parts
+    except Exception:
+        return False
+
 async def main():
     console.clear()
 
-    # Запрашиваем версию параллельно с выводом шапки
+    console.print(f"[bold cyan]DPI Detector v{CURRENT_VERSION}[/bold cyan]")
+    console.print(f"[dim]Параллельных запросов: {config.MAX_CONCURRENT}[/dim]")
+
     version_task = asyncio.create_task(_fetch_latest_version())
-
-    latest = await version_task
-    version_suffix = ""
-    if latest and latest != CURRENT_VERSION:
-        version_suffix = f" | [bold yellow]Доступна версия {latest}[/bold yellow]"
-
-    console.print(
-        f"[bold cyan]DPI Detector v{CURRENT_VERSION}[/bold cyan]{version_suffix}"
-    )
-    console.print(
-        f"[dim]Параллельных запросов: {config.MAX_CONCURRENT}[/dim]\n"
-    )
+    latest_version_notified = False
 
     selection = await ask_test_selection()
     run_dns     = "1" in selection
@@ -152,8 +155,11 @@ async def main():
 
     save_to_file = False
     result_path  = None
+
     try:
-        console.print("\nСохранять результаты в файл? [y/N]: ", end="")
+        sys.stdout.write("\nСохранять результаты в файл? [y/N]: ")
+        sys.stdout.flush()
+
         raw = await _readline_cancelable()
         raw = raw.strip().lower()
     except KeyboardInterrupt:
@@ -208,6 +214,17 @@ async def main():
 
         console.print("\n[bold green]Проверка завершена.[/bold green]")
 
+        # ── Уведомление о новой версии ────────────────────────
+        if not latest_version_notified:
+            try:
+                latest = await asyncio.wait_for(asyncio.shield(version_task), timeout=0.1)
+                if latest and is_newer(latest, CURRENT_VERSION):
+                    console.print(f"[bold yellow](!) Доступна новая версия: {latest}[/bold yellow]")
+                    console.print(f"[dim]https://github.com/{GITHUB_REPO}/releases[/dim]")
+                latest_version_notified = True
+            except (asyncio.TimeoutError, Exception):
+                pass
+
         if save_to_file and result_path:
             try:
                 with open(result_path, "w", encoding="utf-8") as f:
@@ -218,7 +235,7 @@ async def main():
 
         # ── Предложение повторить ─────────────────────────────────────────────
         console.print(
-            "\nНажмите [bold green]Enter[/bold green] чтобы повторить проверку  "
+            "\nНажмите [bold green]Enter[/bold green] чтобы повторить проверку "
             "или [bold red]Ctrl+C[/bold red] для выхода"
         )
         _flush_stdin()  # сбрасываем накопившиеся Enter чтобы не было авто-перезапуска
