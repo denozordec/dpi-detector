@@ -3,29 +3,25 @@
 """
 
 # === Основные настройки ===
-USE_IPV4_ONLY = True
 MAX_CONCURRENT = 70
 
 # === Таймауты ===
 TIMEOUT = 7.0
 TIMEOUT_TCP_16_20 = 10.0
 
-# === Повторные попытки ===
-DOMAIN_CHECK_RETRIES = 1
-TCP_16_20_CHECK_RETRIES = 1
-
 # === TCP блокировка ===
 TCP_BLOCK_MIN_KB = 1
 TCP_BLOCK_MAX_KB = 69
 FAT_DEFAULT_SNI = "example.com"
+FAT_HEADER_KB = 64
+FAT_CONNECT_TIMEOUT = 8.0
+FAT_READ_TIMEOUT = 12.0
 
 # === Отображение ===
-SHOW_DATA_SIZE = False
 BODY_INSPECT_LIMIT = 8192
-DATA_READ_THRESHOLD = 70 * 1024
 
 # === User Agent ===
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
 # === Маркеры блокировок HTTP ===
 BLOCK_MARKERS = [
