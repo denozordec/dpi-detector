@@ -68,19 +68,24 @@ def _parse_http_status(data: bytes) -> int:
 async def _do_short(ip: str, port: int, sni: Optional[str] = None) -> Tuple[bool, str]:
     """
     HEAD-запрос для проверки живости хоста.
-    Возвращает (alive, alive_str). alive=True если получили любой HTTP статус.
+    Возвращает (alive, alive_str). alive=True если получили любой HTTP-статус.
     """
     try:
         reader, writer = await _open_connection(ip, port, sni)
     except asyncio.TimeoutError:
         return False, "No (timeout)"
+    except OSError as e:
+        # Разделяем refused и прочие сетевые ошибки для более понятного вывода
+        import errno as _errno
+        if e.errno in (_errno.ECONNREFUSED, config.WSAECONNREFUSED):
+            return False, "No (refused)"
+        return False, "No (conn err)"
     except Exception:
         return False, "No (conn err)"
 
     try:
         writer.write(_build_short_request(ip, port))
         await asyncio.wait_for(writer.drain(), timeout=config.FAT_CONNECT_TIMEOUT)
-
         try:
             chunk = await asyncio.wait_for(reader.read(512), timeout=config.FAT_READ_TIMEOUT)
             status = _parse_http_status(chunk)
@@ -109,7 +114,7 @@ async def _do_fat(ip: str, port: int, sni: Optional[str] = None) -> Tuple[str, s
     try:
         reader, writer = await _open_connection(ip, port, sni)
     except asyncio.TimeoutError:
-        return "[red]TIMEOUT[/red]", "Handshake timeout: connect timeout"
+        return "[red]TIMEOUT[/red]", "Handshake timeout"
     except ssl.SSLError as e:
         return "[red]TLS ERR[/red]", f"TLS: {str(e)[:40]}"
     except ConnectionRefusedError:
@@ -123,12 +128,11 @@ async def _do_fat(ip: str, port: int, sni: Optional[str] = None) -> Tuple[str, s
     try:
         payload = _build_fat_request(ip, port)
         total = len(payload)
-        chunk_size = 4096
         offset = 0
 
         try:
             while offset < total:
-                end = min(offset + chunk_size, total)
+                end = min(offset + 4096, total)
                 writer.write(payload[offset:end])
                 await asyncio.wait_for(writer.drain(), timeout=config.FAT_READ_TIMEOUT)
                 bytes_sent += end - offset
@@ -167,10 +171,8 @@ async def _do_fat(ip: str, port: int, sni: Optional[str] = None) -> Tuple[str, s
 async def _fat_probe(ip: str, port: int, sni: Optional[str] = None) -> Tuple[str, str, str]:
     """SHORT alive-check → если жив, FAT-проверка. Возвращает (alive_str, status, detail)."""
     alive, alive_str = await _do_short(ip, port, sni)
-
     if not alive:
         return alive_str, "[yellow]UNREACHABLE[/yellow]", "Host not responding"
-
     fat_status, fat_detail = await _do_fat(ip, port, sni)
     return alive_str, fat_status, fat_detail
 
@@ -178,24 +180,6 @@ async def _fat_probe(ip: str, port: int, sni: Optional[str] = None) -> Tuple[str
 async def check_tcp_16_20(
     ip: str, port: int, sni: Optional[str], semaphore: asyncio.Semaphore
 ) -> Tuple[str, str, str]:
-    """
-    TCP_16_20_CHECK_RETRIES попыток fat-probe.
-    Возвращает (alive_str, status, detail) с приоритетом DETECTED.
-    """
-    results = []
-    for attempt in range(config.TCP_16_20_CHECK_RETRIES):
-        async with semaphore:
-            alive_str, status, detail = await _fat_probe(ip, port, sni)
-        results.append((alive_str, status, detail))
-        if attempt < config.TCP_16_20_CHECK_RETRIES - 1:
-            await asyncio.sleep(0.15)
-
-    for item in results:
-        if "DETECTED" in item[1]:
-            return item
-
-    for item in results:
-        if "OK" not in item[1] and "UNREACHABLE" not in item[1]:
-            return item
-
-    return results[0]
+    """Одна fat-probe попытка. Возвращает (alive_str, status, detail)."""
+    async with semaphore:
+        return await _fat_probe(ip, port, sni)
