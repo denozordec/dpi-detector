@@ -1,0 +1,95 @@
+name: Release CI (Docker + EXE)
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - python-version: '3.14'
+            suffix: 'win10'
+          - python-version: '3.8'
+            suffix: 'win7'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx rich pyinstaller
+
+      - name: Build with PyInstaller
+        shell: bash
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          EXE_NAME="dpi_detector_${VERSION}_${{ matrix.suffix }}"
+          
+          python -m PyInstaller --onefile --console --clean \
+            --collect-all rich \
+            --collect-all httpx \
+            --add-data "domains.txt;." \
+            --add-data "tcp16.json;." \
+            --name "$EXE_NAME" \
+            dpi_detector.py
+
+      - name: Upload EXE to Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
