@@ -1,3 +1,5 @@
+import os
+import sys
 """
 Конфигурация DPI Detector
 """
@@ -55,8 +57,7 @@ DNS_CHECK_DOMAINS = [
     "flibusta.is",
     "clubtone.do.am",
     "rezka.ag",
-    "shikimori.one",
-    "youtube.com"
+    "shikimori.one"
 ]
 
 DNS_UDP_SERVERS = [
@@ -80,3 +81,18 @@ DNS_DOH_SERVERS = [
    ("https://dns.adguard-dns.com/resolve",  "AdGuard"),
    ("https://dns.alidns.com/resolve",       "Alibaba"),
 ]
+
+# хак для переопределения дефолтного config.py
+if getattr(sys, 'frozen', False):
+    exe_dir = os.path.dirname(sys.executable)
+else:
+    exe_dir = os.path.dirname(os.path.abspath(__file__))
+
+external_config_path = os.path.join(exe_dir, "config.py")
+
+if os.path.exists(external_config_path) and os.path.abspath(__file__) != external_config_path:
+    try:
+        with open(external_config_path, 'r', encoding='utf-8') as ext_f:
+            exec(ext_f.read(), globals())
+    except Exception as e:
+        print(f"Ошибка при загрузке внешнего config.py: {e}")
