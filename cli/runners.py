@@ -1,3 +1,4 @@
+from typing import Tuple
 import re
 import socket
 import asyncio
@@ -5,12 +6,13 @@ import asyncio
 import httpx
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.live import Live
 
 import config
 from cli.console import console
 from cli.ui import clean_hostname, build_domain_row
 from core.tls_scanner import check_domain_tls, check_http_injection, create_dpi_client
-from core.tcp16_scanner import check_tcp_16_20
+from core.tcp16_scanner import check_tcp_16_20, check_tcp_16_20_with_rtt
 from utils.network import get_resolved_ip
 
 
@@ -270,117 +272,208 @@ async def run_tcp_test(semaphore: asyncio.Semaphore, tcp_items: list) -> dict:
 
 # ── Тест 4: Поиск белых SNI для ASN ──────────────────────────────────────────
 
+_SNI_BATCH_SIZE = 5
+
+
 async def run_whitelist_sni_test(semaphore: asyncio.Semaphore, tcp_items: list, whitelist_sni: list) -> None:
     """Тест 4: Поиск белых SNI для ASN.
 
     Алгоритм:
-      1. Для каждой AS берём один IP с портом 443.
-      2. Запускаем стандартный TCP 16-20KB тест с дефолтным SNI.
-      3. Для тех AS где DETECTED — перебираем SNI из whitelist_sni.txt до первого OK.
-      4. Выводим таблицу: ASN | Провайдер | Alive | WL SNI | Найденный SNI / статус.
+      1. Берём все IP с портом 443.
+      2. Базовая проверка — находим DETECTED IP для каждой AS.
+         Если у AS несколько IP — берём DETECTED с наименьшим RTT.
+      3. Для каждой DETECTED AS перебираем SNI:
+         сначала пустой ("без SNI"), затем батчами из файла.
+      4. Live-таблица показывает только строки подбора SNI (по одной на AS).
     """
-    # Фильтрация: только порт 443, по одному IP на AS
-    seen_asn: set = set()
-    candidates = []
-    for item in tcp_items:
-        port = int(item.get("port", 443))
-        if port != 443:
-            continue
-        asn_raw = str(item.get("asn", "")).strip()
-        asn_key = asn_raw.upper().lstrip("AS") if asn_raw else item["ip"]
-        if asn_key in seen_asn:
-            continue
-        seen_asn.add(asn_key)
-        candidates.append(item)
+    port443_items = [item for item in tcp_items if int(item.get("port", 443)) == 443]
 
-    if not candidates:
+    if not port443_items:
         console.print("[yellow]Нет целей с портом 443 для теста белых SNI.[/yellow]")
         return
 
+    # Строим индекс SNI -> номер в файле (1-based)
+    sni_index: dict = {}
+    clean_sni_list = []
+    num = 0
+    for line in whitelist_sni:
+        s = line.strip()
+        if s and not s.startswith('#'):
+            num += 1
+            sni_index[s] = num
+            clean_sni_list.append(s)
+
+    from collections import defaultdict
+    asn_to_items: dict = defaultdict(list)
+    for item in port443_items:
+        asn_raw = str(item.get("asn", "")).strip()
+        asn_key = asn_raw.upper().lstrip("AS") if asn_raw else item["ip"]
+        asn_to_items[asn_key].append(item)
+
     console.print(
         f"\n[bold]Поиск белых SNI для ASN[/bold]  "
-        f"[dim]AS: {len(candidates)} | SNI в списке: {len(whitelist_sni)} | timeout: {config.FAT_CONNECT_TIMEOUT}s[/dim]"
+        f"[dim]AS: {len(asn_to_items)} | IP: {len(port443_items)}"
+        f" | SNI: {len(clean_sni_list)} | батч: {_SNI_BATCH_SIZE}[/dim]"
     )
 
-    # Фаза 1: базовый тест с дефолтным SNI
-    base_results = await _run_with_progress(
-        [_tcp16_worker(item, semaphore) for item in candidates],
+    # ── Фаза 1: базовая проверка всех IP ─────────────────────────────────────
+    async def _base_worker(item: dict) -> dict:
+        ip      = item["ip"]
+        sni     = item.get("sni") or config.FAT_DEFAULT_SNI
+        asn_raw = str(item.get("asn", "")).strip()
+        asn_str = (
+            f"AS{asn_raw}"
+            if asn_raw and not asn_raw.upper().startswith("AS")
+            else asn_raw.upper()
+        ) or "-"
+        asn_key = asn_raw.upper().lstrip("AS") if asn_raw else ip
+        alive_str, status, detail, rtt = await check_tcp_16_20_with_rtt(ip, 443, sni, semaphore)
+        return {
+            "item":    item,
+            "id":      item.get("id", ip),
+            "asn_str": asn_str,
+            "asn_key": asn_key,
+            "provider": item["provider"],
+            "alive":   alive_str,
+            "status":  status,
+            "detail":  detail,
+            "rtt":     rtt,
+        }
+
+    base_rows = await _run_with_progress(
+        [_base_worker(item) for item in port443_items],
         "Фаза 1/2: Базовая проверка...",
     )
-    # base_results[i] = [id, asn_str, provider, alive_str, status, detail]
 
-    # Фаза 2: для DETECTED ищем белый SNI
-    detected_indices = [
-        i for i, r in enumerate(base_results) if "DETECTED" in r[4]
-    ]
-
-    # sni_result[i] = (wl_status_str, found_sni)
-    sni_result: dict = {}
-
-    async def _probe_sni(idx: int, item: dict) -> None:
-        ip = item["ip"]
-        for sni_candidate in whitelist_sni:
-            sni_candidate = sni_candidate.strip()
-            if not sni_candidate:
-                continue
-            # Используем внутренний семафор на 1, внешний semaphore уже захвачен в check_tcp_16_20
-            _alive, status_s, _detail = await check_tcp_16_20(ip, 443, sni_candidate, semaphore)
-            if "OK" in status_s:
-                sni_result[idx] = ("[green]OK[/green]", sni_candidate)
-                return
-        sni_result[idx] = ("[red]НЕ НАЙДЕН[/red]", "")
-
-    if detected_indices:
-        total = len(detected_indices)
-        probe_tasks = [_probe_sni(i, candidates[i]) for i in detected_indices]
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
-            task_id = progress.add_task(f"Фаза 2/2: Перебор SNI...", total=total)
-            done_count = 0
-            for future in asyncio.as_completed(probe_tasks):
-                await future
-                done_count += 1
-                progress.update(task_id, completed=done_count,
-                                description=f"Фаза 2/2: Перебор SNI... ({done_count}/{total})")
-
-    # Вывод итоговой таблицы
-    table = Table(show_header=True, header_style="bold magenta", border_style="dim")
-    table.add_column("ASN",       style="yellow")
-    table.add_column("Провайдер", style="cyan")
-    table.add_column("Alive",     justify="center")
-    table.add_column("WL SNI",    justify="center")
-    table.add_column("Детали",    style="dim", no_wrap=True)
-
-    found_count = 0
-    for i, (item, base_row) in enumerate(zip(candidates, base_results)):
-        asn_str     = base_row[1]
-        provider    = base_row[2]
-        alive_str   = base_row[3]
-        base_status = base_row[4]
-        base_detail = base_row[5]
-
-        if "DETECTED" in base_status and i in sni_result:
-            wl_status, found_sni = sni_result[i]
-            if found_sni:
-                detail_str = found_sni
-                found_count += 1
-            else:
-                detail_str = base_detail
-        elif "OK" in base_status:
-            wl_status  = "[dim]—[/dim]"
-            detail_str = "[dim]Не заблокирован[/dim]"
+    # Для каждой AS выбираем DETECTED IP с наименьшим RTT
+    asn_candidate: dict = {}
+    for row in base_rows:
+        if "DETECTED" not in row["status"]:
+            continue
+        ak = row["asn_key"]
+        if ak not in asn_candidate:
+            asn_candidate[ak] = row
         else:
-            wl_status  = "[dim]—[/dim]"
-            detail_str = base_detail
+            prev_rtt = asn_candidate[ak]["rtt"] or 9999
+            curr_rtt = row["rtt"] or 9999
+            if curr_rtt < prev_rtt:
+                asn_candidate[ak] = row
 
-        table.add_row(asn_str, provider, alive_str, wl_status, detail_str)
+    detected_rows = list(asn_candidate.values())
 
-    console.print(table)
+    if not detected_rows:
+        console.print("[green]Ни одна AS не заблокирована — перебор SNI не нужен.[/green]")
+        return
 
+    console.print(
+        f"[dim]Фаза 2/2: Перебор SNI для {len(detected_rows)} AS"
+        f" (батч {_SNI_BATCH_SIZE}, таймаут динамический)...[/dim]"
+    )
+
+    # Ключ всех словарей = row["id"]
+    sni_found: dict     = {}
+    progress_info: dict = {row["id"]: "[dim]ожидание...[/dim]" for row in detected_rows}
+
+    async def _probe_sni_batched(row: dict) -> None:
+        ip     = row["item"]["ip"]
+        row_id = row["id"]
+        hint   = row["rtt"]
+
+        # Шаг 0: без SNI
+        progress_info[row_id] = "[dim]без SNI...[/dim]"
+        try:
+            _a, st0, _d = await check_tcp_16_20(ip, 443, "", semaphore, hint_rtt=hint)
+            if "OK" in st0:
+                sni_found[row_id] = ("(без SNI)", 0)
+                progress_info[row_id] = "[bold green](без SNI)[/bold green]"
+                return
+        except Exception:
+            pass
+
+        batches = [
+            clean_sni_list[i:i + _SNI_BATCH_SIZE]
+            for i in range(0, len(clean_sni_list), _SNI_BATCH_SIZE)
+        ]
+
+        for batch in batches:
+            first_num = sni_index.get(batch[0], "?")
+            last_num  = sni_index.get(batch[-1], "?")
+            progress_info[row_id] = f"[dim]#{first_num}–#{last_num}...[/dim]"
+
+            async def _one(sni: str):
+                a, s, d = await check_tcp_16_20(ip, 443, sni, semaphore, hint_rtt=hint)
+                return sni, a, s, d
+
+            tasks: list = [asyncio.create_task(_one(sni)) for sni in batch]
+            found = False
+
+            for fut in asyncio.as_completed(tasks):
+                try:
+                    sni_done, _a, st, _d = await fut
+                except (asyncio.CancelledError, Exception):
+                    continue
+                if "OK" in st:
+                    found = True
+                    sni_num = sni_index.get(sni_done, 0)
+                    sni_found[row_id] = (sni_done, sni_num)
+                    safe = sni_done.replace(".", "\u200b.")
+                    progress_info[row_id] = (
+                        f"[bold green]{safe}[/bold green] [dim]#{sni_num}[/dim]"
+                    )
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    break
+
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if found:
+                break
+
+        if row_id not in sni_found:
+            sni_found[row_id] = ("", 0)
+            progress_info[row_id] = "[red]НЕ НАЙДЕН[/red]"
+
+    # ── Live таблица — только строки подбора SNI ──────────────────────────────
+    def _build_live_table() -> Table:
+        t = Table(show_header=True, header_style="bold magenta", border_style="dim")
+        t.add_column("ID",        style="white",  no_wrap=True)
+        t.add_column("Провайдер", style="cyan",   no_wrap=True, min_width=14)
+        t.add_column("ASN",       style="yellow", no_wrap=True)
+        t.add_column("WL SNI",    justify="center")
+        t.add_column("Детали",    min_width=36)
+
+        for row in sorted(detected_rows, key=lambda r: r["provider"].lower()):
+            rid  = row["id"]
+            info = progress_info.get(rid, "…")
+            if rid in sni_found and sni_found[rid][0]:
+                wl = "[green]OK[/green]"
+            elif rid in sni_found:
+                wl = "[red]НЕТ[/red]"
+            else:
+                wl = "[yellow]…[/yellow]"
+            t.add_row(row["id"], row["provider"], row["asn_str"], wl, info)
+        return t
+
+    with Live(_build_live_table(), console=console, refresh_per_second=4) as live:
+        probe_tasks = [_probe_sni_batched(row) for row in detected_rows]
+        gathered = asyncio.gather(*probe_tasks, return_exceptions=True)
+
+        async def _refresh_loop():
+            while not gathered.done():
+                live.update(_build_live_table())
+                await asyncio.sleep(0.25)
+
+        refresh_task = asyncio.create_task(_refresh_loop())
+        await gathered
+        refresh_task.cancel()
+        live.update(_build_live_table())
+
+    found_count = sum(1 for v in sni_found.values() if v[0])
     if found_count > 0:
         console.print(
-            f"[green]Найдено белых SNI: {found_count} из {len(detected_indices)} заблокированных AS[/green]"
+            f"[green]Найдено белых SNI: {found_count} из {len(detected_rows)} заблокированных AS[/green]"
         )
-    elif detected_indices:
+    else:
         console.print(
-            f"[yellow]Белые SNI не найдены ни для одной из {len(detected_indices)} заблокированных AS[/yellow]"
+            f"[yellow]Белые SNI не найдены ни для одной из {len(detected_rows)} заблокированных AS[/yellow]"
         )
