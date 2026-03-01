@@ -17,7 +17,6 @@ proton.me
 protonvpn.com
 roskomsvoboda.org/ru/
 amnezia.org
-rutracker.org/forum/in
 nnmclub.to
 rezka.ag
 hub.docker.com
