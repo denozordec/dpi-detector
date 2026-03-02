@@ -10,13 +10,20 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ─── Gauge storage ────────────────────────────────────────────────────────────
 
 _metrics: Dict[str, object] = {}
 _lock = threading.Lock()
 _last_run_ts: float = 0.0
+
+# Per-domain: {domain: status_string}  e.g. "ok" | "blocked" | "timeout" | "dns_fail"
+_domain_status: Dict[str, str] = {}
+
+# Per-TCP-target: {target_id: {"provider": str, "asn": str, "status": str}}
+# status: "ok" | "blocked" | "mixed" | "unknown"
+_tcp_target_status: Dict[str, Dict[str, str]] = {}
 
 
 def record_dns(total: int, intercepted: int, ok: int) -> None:
@@ -28,7 +35,7 @@ def record_dns(total: int, intercepted: int, ok: int) -> None:
 
 
 def record_domains(total: int, ok: int, blocked: int, timeout: int, dns_fail: int) -> None:
-    """Update domain reachability metrics."""
+    """Update domain reachability aggregate metrics."""
     with _lock:
         _metrics["dpi_domains_total"] = total
         _metrics["dpi_domains_ok"] = ok
@@ -37,8 +44,21 @@ def record_domains(total: int, ok: int, blocked: int, timeout: int, dns_fail: in
         _metrics["dpi_domains_dns_fail"] = dns_fail
 
 
+def record_domain_statuses(statuses: List[Tuple[str, str]]) -> None:
+    """Update per-domain availability metrics.
+
+    Args:
+        statuses: list of (domain, status) where status is one of:
+                  "ok", "blocked", "timeout", "dns_fail"
+    """
+    with _lock:
+        _domain_status.clear()
+        for domain, status in statuses:
+            _domain_status[domain] = status
+
+
 def record_tcp(total: int, ok: int, blocked: int, mixed: int) -> None:
-    """Update TCP 16-20KB DPI metrics."""
+    """Update TCP 16-20KB DPI aggregate metrics."""
     with _lock:
         _metrics["dpi_tcp_total"] = total
         _metrics["dpi_tcp_ok"] = ok
@@ -46,11 +66,33 @@ def record_tcp(total: int, ok: int, blocked: int, mixed: int) -> None:
         _metrics["dpi_tcp_mixed"] = mixed
 
 
+def record_tcp_target_statuses(targets: List[Dict[str, str]]) -> None:
+    """Update per-TCP-target availability metrics.
+
+    Args:
+        targets: list of dicts with keys: "id", "provider", "asn", "status"
+                 status is one of: "ok", "blocked", "mixed", "unknown"
+    """
+    with _lock:
+        _tcp_target_status.clear()
+        for t in targets:
+            _tcp_target_status[t["id"]] = {
+                "provider": t.get("provider", ""),
+                "asn": t.get("asn", ""),
+                "status": t.get("status", "unknown"),
+            }
+
+
 def record_run_timestamp() -> None:
     """Update timestamp of last completed check run."""
     global _last_run_ts
     with _lock:
         _last_run_ts = time.time()
+
+
+def _escape_label(value: str) -> str:
+    """Escape label value for Prometheus text format."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def _render_metrics() -> str:
@@ -75,7 +117,10 @@ def _render_metrics() -> str:
     with _lock:
         snapshot = dict(_metrics)
         ts = _last_run_ts
+        domain_snap = dict(_domain_status)
+        tcp_snap = dict(_tcp_target_status)
 
+    # ── Aggregate metrics ──────────────────────────────────────────────────────
     for name, (mtype, help_text) in meta.items():
         value = snapshot.get(name)
         if value is None:
@@ -84,10 +129,54 @@ def _render_metrics() -> str:
         lines.append(f"# TYPE {name} {mtype}")
         lines.append(f"{name} {value}")
 
-    # Last run timestamp
+    # ── Last run timestamp ─────────────────────────────────────────────────────
     lines.append("# HELP dpi_last_run_timestamp_seconds Unix timestamp of last completed test run")
     lines.append("# TYPE dpi_last_run_timestamp_seconds gauge")
     lines.append(f"dpi_last_run_timestamp_seconds {ts:.3f}")
+
+    # ── Per-domain availability ────────────────────────────────────────────────
+    # dpi_domain_available{domain="example.com", status="ok"} 1
+    # Emits one time series per domain with value 1 (current status as label).
+    # Also emits dpi_domain_ok{domain="..."} 1|0 for easy alerting.
+    if domain_snap:
+        lines.append("# HELP dpi_domain_available Per-domain availability status (1=current state)")
+        lines.append("# TYPE dpi_domain_available gauge")
+        for domain, status in sorted(domain_snap.items()):
+            d_esc = _escape_label(domain)
+            s_esc = _escape_label(status)
+            lines.append(f'dpi_domain_available{{domain="{d_esc}",status="{s_esc}"}} 1')
+
+        lines.append("# HELP dpi_domain_ok Per-domain reachability: 1=ok, 0=not ok")
+        lines.append("# TYPE dpi_domain_ok gauge")
+        for domain, status in sorted(domain_snap.items()):
+            d_esc = _escape_label(domain)
+            value = 1 if status == "ok" else 0
+            lines.append(f'dpi_domain_ok{{domain="{d_esc}"}} {value}')
+
+    # ── Per-TCP-target status ──────────────────────────────────────────────────
+    # dpi_tcp_target_ok{id="...", provider="...", asn="..."} 1|0
+    if tcp_snap:
+        lines.append("# HELP dpi_tcp_target_status Per-TCP-target DPI status (1=current state)")
+        lines.append("# TYPE dpi_tcp_target_status gauge")
+        for tid, info in sorted(tcp_snap.items()):
+            t_esc = _escape_label(tid)
+            p_esc = _escape_label(info["provider"])
+            a_esc = _escape_label(info["asn"])
+            s_esc = _escape_label(info["status"])
+            lines.append(
+                f'dpi_tcp_target_status{{id="{t_esc}",provider="{p_esc}",asn="{a_esc}",status="{s_esc}"}} 1'
+            )
+
+        lines.append("# HELP dpi_tcp_target_ok Per-TCP-target: 1=ok (DPI not detected), 0=blocked/mixed")
+        lines.append("# TYPE dpi_tcp_target_ok gauge")
+        for tid, info in sorted(tcp_snap.items()):
+            t_esc = _escape_label(tid)
+            p_esc = _escape_label(info["provider"])
+            a_esc = _escape_label(info["asn"])
+            value = 1 if info["status"] == "ok" else 0
+            lines.append(
+                f'dpi_tcp_target_ok{{id="{t_esc}",provider="{p_esc}",asn="{a_esc}"}} {value}'
+            )
 
     return "\n".join(lines) + "\n"
 
