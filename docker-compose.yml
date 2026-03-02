@@ -1,15 +1,32 @@
 services:
-  dpi-detector:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Режим 1: одиночная проверка — запустить и завершить
+  #   docker compose run --rm dpi-once
+  # ──────────────────────────────────────────────────────────────────────────
+  dpi-once:
     build: .
-    container_name: dpi-detector
+    container_name: dpi-detector-once
+    environment:
+      RUN_MODE: "once"        # запустить тесты один раз и выйти
+      TESTS: "123"            # 1=DNS, 2=Домены, 3=TCP 16-20KB
+      METRICS_PORT: "9090"
+    # Метрики нужны редко при одиночном запуске, порт не пробрасываем
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Режим 2: фоновый демон — проверки каждые 2 часа + Prometheus метрики
+  #   docker compose up -d dpi-schedule
+  # ──────────────────────────────────────────────────────────────────────────
+  dpi-schedule:
+    build: .
+    container_name: dpi-detector-schedule
     restart: unless-stopped
     environment:
-      DOCKER_MODE: "1"
-      CHECK_INTERVAL: "300"       # интервал между проверками, секунды
+      RUN_MODE: "schedule"    # повторять по расписанию
+      TESTS: "123"            # набор тестов
+      CHECK_INTERVAL: "7200" # интервал между проверками, секунды (7200 = 2 часа)
       METRICS_PORT: "9090"
       METRICS_USER: "prometheus"  # Basic Auth логин
       METRICS_PASSWORD: "secret"  # Basic Auth пароль — СМЕНИТЕ!
     ports:
       - "9090:9090"
-    # Выбор тестов задаётся через TEST_SELECTION (по умолчанию — все: 1234)
-    # Если нужны только тесты 2 и 3: TEST_SELECTION=23
