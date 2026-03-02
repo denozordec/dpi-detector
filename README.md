@@ -8,9 +8,11 @@
 # 🔍 DPI Detector
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](https://github.com/Runnin4ik/dpi-detector/pkgs/container/dpi-detector)
+[![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](https://github.com/denozordec/dpi-detector)
 
 Инструмент для анализа цензуры трафика в России: обнаруживает и классифицирует блокировки сайтов, хостингов и CDN (TCP16-20 блокировки), а также подмену DNS-запросов провайдером.
+
+> **Fork** от [Runnin4ik/dpi-detector](https://github.com/Runnin4ik/dpi-detector) с расширенными возможностями запуска через Docker.
 
 ![Пример результатов](https://raw.githubusercontent.com/Runnin4ik/dpi-detector/main/images/screenshot.png)
 
@@ -20,101 +22,177 @@
 - **Подбор белых SNI для AS хостингов/CDN**
 - **Проверка доступности заблокированных сайтов** — тестирует TLS 1.2, TLS 1.3 и HTTP
 - **Проверка DNS** — выявляет перехват UDP/53, подмену IP-адресов заглушками и блокировку DoH
-- **Классификация ошибок** — различает TCP RST, Connection Abort,
-  Handshake/Read Timeout, TLS MITM, SNI-блокировку и другие
-- **Гибкая настройка** — таймауты, потоки, свои списки доменов, DNS-серверы
-  и IPv4-only режим
+- **Классификация ошибок** — различает TCP RST, Connection Abort, Handshake/Read Timeout, TLS MITM, SNI-блокировку и другие
+- **Гибкая настройка** — таймауты, потоки, свои списки доменов, DNS-серверы и IPv4-only режим
+- **Два режима запуска** — одиночная проверка (`once`) или фоновый демон по расписанию (`schedule`)
 
 ### ⚙️ Кастомизация
-Следующие файлы могут быть переопределены. Инструкции ниже.
+Следующие файлы могут быть переопределены:
 
-1.  `domains.txt` — список доменов для проверки.
-2.  `tcp16.json` — цели для теста TCP 16-20KB.
-3.  `config.py` — конфигурация.
-4.  `whitelist_sni.txt` — список белых SNI для подбора рабочих
+1. `domains.txt` — список доменов для проверки
+2. `tcp16.json` — цели для теста TCP 16-20KB
+3. `config.py` — конфигурация
+4. `whitelist_sni.txt` — список белых SNI для подбора рабочих
 
 > [!WARNING]  
 > Если у вас запущены средства обхода блокировок (например, zapret или GoodbyeDPI), результаты тестов будут искажены. Чтобы узнать реальное состояние фильтров вашего провайдера, выключите их перед началом проверки или убедитесь, что они работают в режиме обработки всех пакетов (режим ALL), а не только по списку.
 
-## 🐋 Docker (Рекомендовано)
+---
 
-### Быстрый старт
-Docker проверит наличие обновлений и скачает свежую версию перед запуском
+## 🐋 Docker
+
+### Переменные окружения
+
+| Переменная | Значения | По умолчанию | Описание |
+|---|---|---|---|
+| `RUN_MODE` | `once` / `schedule` | `schedule` | Режим запуска |
+| `TESTS` | комбинация `1234` | `123` | Набор тестов (1=DNS, 2=Домены, 3=TCP, 4=SNI) |
+| `CHECK_INTERVAL` | секунды | `7200` | Интервал между проверками (только `schedule`) |
+| `METRICS_PORT` | порт | `9090` | Порт Prometheus-метрик |
+| `METRICS_USER` | строка | — | Basic Auth логин для метрик |
+| `METRICS_PASSWORD` | строка | — | Basic Auth пароль для метрик |
+
+---
+
+### 🔂 Режим `once` — одиночная проверка
+
+Запустить тесты один раз и завершить контейнер. Удобно для cron, CI или ручного запуска.
+
 ```bash
-docker run --rm -it --pull=always ghcr.io/runnin4ik/dpi-detector:latest
-```
-Или запускайте с указанием определенной версии  
-Это избавляет от постоянных скачиваний, но нужно следить за актуальностью версий
-```bash
-docker run --rm -it ghcr.io/runnin4ik/dpi-detector:2.0.1
+# Сборка и запуск
+git clone https://github.com/denozordec/dpi-detector.git
+cd dpi-detector
+docker compose run --rm dpi-once
 ```
 
-#### С кастомизацией
-Переопределите нужные файлы: `domains.txt`, `tcp16.json`...
-Запустите с монтированием (можно монтировать один или несколько файлов)
+Или напрямую через `docker run`:
 ```bash
-# Bash (Linux / macOS)
-docker run --rm -it --pull=always \
+docker run --rm \
+  -e RUN_MODE=once \
+  -e TESTS=123 \
+  $(docker build -q .)
+```
+
+С монтированием своих файлов:
+```bash
+docker compose run --rm \
   -v $(pwd)/domains.txt:/app/domains.txt \
-  -v $(pwd)/tcp16.json:/app/tcp16.json \
   -v $(pwd)/config.py:/app/config.py \
-  -v $(pwd)/whitelist_sni.txt:/app/whitelist_sni.txt \
-  ghcr.io/runnin4ik/dpi-detector:latest
+  dpi-once
 ```
-<details>
-<summary>Команды для PowerShell и CMD</summary>
 
-PowerShell (Windows)
+---
+
+### 🔁 Режим `schedule` — фоновый демон
+
+Запустить как сервис: тесты повторяются каждые `CHECK_INTERVAL` секунд, метрики доступны на порту 9090 для Prometheus/Grafana.
+
 ```bash
-docker run --rm -it --pull=always `
-  -v ${PWD}/domains.txt:/app/domains.txt `
-  -v ${PWD}/tcp16.json:/app/tcp16.json `
-  -v ${PWD}/config.py:/app/config.py `
-  -v ${PWD}/whitelist_sni.txt:/app/whitelist_sni.txt `
-  ghcr.io/runnin4ik/dpi-detector:latest
+git clone https://github.com/denozordec/dpi-detector.git
+cd dpi-detector
+docker compose up -d dpi-schedule
 ```
 
-CMD (Windows)
+Посмотреть логи:
 ```bash
-docker run --rm -it --pull=always ^
-  -v %cd%/domains.txt:/app/domains.txt ^
-  -v %cd%/tcp16.json:/app/tcp16.json ^
-  -v %cd%/config.py:/app/config.py ^
-  -v %cd%/whitelist_sni.txt:/app/whitelist_sni.txt ^
-  ghcr.io/runnin4ik/dpi-detector:latest
+docker compose logs -f dpi-schedule
 ```
-</details>
 
-## 🐍 Python 3.8+
+Остановить:
+```bash
+docker compose down
+```
+
+С кастомными файлами (`docker-compose.override.yml`):
+```yaml
+services:
+  dpi-schedule:
+    volumes:
+      - ./domains.txt:/app/domains.txt
+      - ./config.py:/app/config.py
+```
+
+---
+
+### 📊 Prometheus-метрики (только `schedule`)
+
+Метрики доступны по адресу `http://<host>:9090/metrics`.
+
+Пример конфига для `prometheus.yml`:
+```yaml
+scrape_configs:
+  - job_name: dpi-detector
+    static_configs:
+      - targets: ['localhost:9090']
+    basic_auth:
+      username: prometheus
+      password: secret  # укажите свой пароль из METRICS_PASSWORD
+```
+
+> [!WARNING]
+> Обязательно смените `METRICS_PASSWORD` в `docker-compose.yml` перед публичным деплоем!
+
+---
+
+### ⚡ Быстрые примеры
+
+```bash
+# Одиночная проверка, тесты 1+2+3
+docker compose run --rm dpi-once
+
+# Одиночная проверка, только DNS + Домены
+docker run --rm -e RUN_MODE=once -e TESTS=12 $(docker build -q .)
+
+# Фоновый демон, проверка каждый час
+docker run -d \
+  -e RUN_MODE=schedule \
+  -e TESTS=123 \
+  -e CHECK_INTERVAL=3600 \
+  -p 9090:9090 \
+  $(docker build -q .)
+
+# Фоновый демон через compose (по умолчанию каждые 2 часа)
+docker compose up -d dpi-schedule
+```
+
+---
+
+## 🖥️ Интерактивный запуск (без Docker)
+
+При запуске без переменной `RUN_MODE` скрипт задаёт вопросы в интерактивном режиме.
+
+### Python 3.8+
+
 **Требования:** httpx>=0.28, rich>=14.3
 
-**Установка:**
 ```bash
-# скачайте и распакуйте архив руками, или:
-git clone https://github.com/Runnin4ik/dpi-detector.git
+git clone https://github.com/denozordec/dpi-detector.git
 cd dpi-detector
 python -m pip install -r requirements.txt
-```
-
-**Запуск:**
-```bash
 python dpi_detector.py
 ```
 
-## 🪟 Windows (Готовые сборки)
+После выбора тестов появится вопрос о режиме запуска:
+```
+Режим запуска:
+  1 — Одиночная проверка (запустить и выйти)
+  2 — Фоновый режим (повторять по расписанию)
+```
 
-Для использования программы не обязательно устанавливать Python. Скачайте подходящий `.exe` файл в разделе [Releases -> Assets](https://github.com/Runnin4ik/dpi-detector/releases):
+### 🪟 Windows (Готовые сборки)
 
-*   **[Скачать для Windows 10 / 11](https://github.com/Runnin4ik/dpi-detector/releases/download/v2.0.1/dpi_detector_v2.0.1_win10.exe)**
-*   **[Скачать для Windows 7 / 8](https://github.com/Runnin4ik/dpi-detector/releases/download/v2.0.1/dpi_detector_v2.0.1_win7.exe)**
+Скачайте `.exe` в разделе [Releases](https://github.com/Runnin4ik/dpi-detector/releases) оригинального репозитория:
 
-#### С кастомизацией
+- **[Windows 10 / 11](https://github.com/Runnin4ik/dpi-detector/releases/download/v2.0.1/dpi_detector_v2.0.1_win10.exe)**
+- **[Windows 7 / 8](https://github.com/Runnin4ik/dpi-detector/releases/download/v2.0.1/dpi_detector_v2.0.1_win7.exe)**
 
-Переопределите нужные файлы: `domains.txt`, `tcp16.json`, `config.py`, `whitelist_sni.txt`
-И положите их в папку рядом с `.exe` файлом.
+Для кастомизации положите `domains.txt`, `tcp16.json`, `config.py`, `whitelist_sni.txt` рядом с `.exe`.
+
+---
 
 ## 🤝 Вклад в проект
-Приветствуются Issue и Pull Request'ы и предложения функционала!
+
+Приветствуются Issue и Pull Request'ы!
 
 ## 📜 Лицензия
 
@@ -128,28 +206,4 @@ python dpi_detector.py
 
 - Проекту [hyperion-cs/dpi-checkers](https://github.com/hyperion-cs/dpi-checkers) за вдохновение
 - **0ka** за помощь и консультации
-
-## 💖 Поддержка проекта
-
-### [Чаевые картой или по СБП](https://pay.cloudtips.ru/p/1421d4c7)
-
-| Валюта   | Сеть   | Адрес                                              |
-|----------|--------|----------------------------------------------------|
-| **USDT** | TRC20  | `TGtcb4JMT5F3KiEL16oZnj9ijB2Pag1jCX`               |
-| **USDT** | ERC20  | `0x97413028546b5da4cbba4d9838c9d635a5333ab1`       |
-| **USDT** | TON    | `UQApgV57_p0hQGBV9oxrDi7SvKqgN3pigw5YEA28VShrZ7X_` |
-| **TON**  |        | `UQApgV57_p0hQGBV9oxrDi7SvKqgN3pigw5YEA28VShrZ7X_` |
-| **BNB**  | BEP-20 | `0x97413028546b5da4cbba4d9838c9d635a5333ab1`       |
-| **SOL**  |        | `9obMiD8hYfs4D8XskQjHPPtAKYPq9CaEZTbBMxtCjQ3k`     |
-| **BTC**  |        | `bc1q7579xpmxcrz34lzmrxfupkpcczvemeqk2e9f4h`       |
-| **ETH**  |        | `0x97413028546b5da4cbba4d9838c9d635a5333ab1`       |
-
-## Star History
-
-<a href="https://www.star-history.com/#Runnin4ik/dpi-detector&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Runnin4ik/dpi-detector&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Runnin4ik/dpi-detector&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Runnin4ik/dpi-detector&type=date&legend=top-left" />
- </picture>
-</a>
+- [Runnin4ik](https://github.com/Runnin4ik) за оригинальный инструмент
