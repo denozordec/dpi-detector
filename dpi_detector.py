@@ -37,14 +37,29 @@ DOMAINS         = load_domains()
 TCP_16_20_ITEMS = load_tcp_targets()
 WHITELIST_SNI   = load_whitelist_sni()
 
-# Start metrics server if running inside Docker / daemon mode
+# ---------------------------------------------------------------------------
+# Режим запуска:
+#   DOCKER_MODE=1   — старый флаг, по-прежнему работает (treated as schedule)
+#   RUN_MODE=once   — запустить тесты один раз и выйти
+#   RUN_MODE=schedule — запускать периодически (по умолчанию в DOCKER_MODE)
+#   TESTS=123       — набор тестов для неинтерактивного режима (по умолчанию "123")
+#   CHECK_INTERVAL  — интервал в секундах для schedule-режима (по умолчанию 7200)
+# ---------------------------------------------------------------------------
 _DOCKER_MODE = os.environ.get("DOCKER_MODE", "0").lower() in ("1", "true", "yes")
-if _DOCKER_MODE:
+_RUN_MODE    = os.environ.get("RUN_MODE", "").strip().lower()  # once | schedule | ""
+
+# Нормализуем: если задан старый DOCKER_MODE и RUN_MODE не указан явно
+if _DOCKER_MODE and not _RUN_MODE:
+    _RUN_MODE = "schedule"
+
+_NON_INTERACTIVE = _RUN_MODE in ("once", "schedule")  # без интерактивного UI
+
+if _NON_INTERACTIVE:
     start_metrics_server()
 
 
 async def _fetch_latest_version() -> Optional[str]:
-    """Запрашивает последний тег с GitHub API. Возвращает строку версии или None."""
+    """Запрашивает последний тег с GitHub API."""
     url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
@@ -58,7 +73,6 @@ async def _fetch_latest_version() -> Optional[str]:
 
 
 def fast_exit_handler(sig, frame):
-    """Принудительный выход по первому Ctrl+C."""
     sys.stdout.write("\n\033[91m\033[1mПрервано пользователем.\033[0m\n")
     sys.stdout.flush()
     os._exit(0)
@@ -73,7 +87,6 @@ async def _readline_cancelable() -> str:
         raise KeyboardInterrupt
 
 def _flush_stdin() -> None:
-    """Сбрасывает накопившиеся данные в stdin чтобы буферные Enter не перезапускали тест."""
     try:
         import termios
         termios.tcflush(sys.stdin, termios.TCIFLUSH)
@@ -140,124 +153,163 @@ def _format_summary(
 
 
 def is_newer(latest: str, current: str) -> bool:
-    """Сравнивает версии. Возвращает True, если на GitHub версия выше текущей."""
     try:
         def parse(v):
             return tuple(int(x) for x in v.replace('v', '').split('.') if x.isdigit())
-
-        l_parts = parse(latest)
-        c_parts = parse(current)
-        return l_parts > c_parts
+        return parse(latest) > parse(current)
     except Exception:
         return False
 
+
+def _resolve_selection_from_env() -> str:
+    """Читает переменную TESTS и возвращает строку выбора (напр. '123')."""
+    raw = os.environ.get("TESTS", "123").strip()
+    # Валидируем: принимаем только символы 1-4
+    selection = "".join(c for c in raw if c in "1234")
+    return selection or "123"
+
+
+async def _ask_run_mode_interactive() -> str:
+    """Интерактивно спрашивает режим запуска. Возвращает 'once' или 'schedule'."""
+    console.print()
+    console.print("[bold]Режим запуска:[/bold]")
+    console.print("  [bold cyan]1[/bold cyan] — Одиночная проверка (запустить и выйти)")
+    console.print("  [bold cyan]2[/bold cyan] — Фоновый режим (повторять по расписанию)")
+    sys.stdout.write("\nВведите выбор [1]: ")
+    sys.stdout.flush()
+    try:
+        raw = await _readline_cancelable()
+        raw = raw.strip()
+    except KeyboardInterrupt:
+        raise
+    return "schedule" if raw == "2" else "once"
+
+
+async def run_tests(selection: str, semaphore: asyncio.Semaphore):
+    """Выполняет набор тестов по строке выбора, обновляет метрики."""
+    run_dns     = "1" in selection
+    run_domains = "2" in selection
+    run_tcp     = "3" in selection
+    run_wl_sni  = "4" in selection
+
+    stub_ips: set = set()
+    dns_intercept_count = 0
+
+    if run_dns and config.DNS_CHECK_ENABLED:
+        stub_ips, dns_intercept_count = await check_dns_integrity()
+    elif config.DNS_CHECK_ENABLED and (run_domains or run_tcp):
+        stub_ips = await collect_stub_ips_silently()
+
+    if run_dns and config.DNS_CHECK_ENABLED:
+        total_dns = len(config.DNS_CHECK_DOMAINS)
+        record_dns(
+            total=total_dns,
+            intercepted=dns_intercept_count,
+            ok=total_dns - dns_intercept_count,
+        )
+
+    domain_stats = None
+    if run_domains:
+        domain_stats = await run_domains_test(semaphore, stub_ips, DOMAINS)
+        record_domains(
+            total=domain_stats["total"],
+            ok=domain_stats["ok"],
+            blocked=domain_stats["blocked"],
+            timeout=domain_stats["timeout"],
+            dns_fail=domain_stats["dns_fail"],
+        )
+
+    tcp_stats = None
+    if run_tcp:
+        tcp_stats = await run_tcp_test(semaphore, TCP_16_20_ITEMS)
+        record_tcp(
+            total=tcp_stats["total"],
+            ok=tcp_stats["ok"],
+            blocked=tcp_stats["blocked"],
+            mixed=tcp_stats["mixed"],
+        )
+
+    if run_wl_sni:
+        if WHITELIST_SNI:
+            await run_whitelist_sni_test(semaphore, TCP_16_20_ITEMS, WHITELIST_SNI)
+        else:
+            console.print("[yellow]Файл whitelist_sni.txt пуст или не найден — тест 4 пропущен.[/yellow]")
+
+    record_run_timestamp()
+
+    active_tests = sum([run_dns, run_domains, run_tcp, run_wl_sni])
+    if active_tests >= 2:
+        console.print()
+        summary_lines = _format_summary(
+            run_dns, run_domains, run_tcp,
+            dns_intercept_count, domain_stats, tcp_stats,
+        )
+        console.print(Panel(
+            "\n".join(summary_lines),
+            title="[bold]Итог[/bold]",
+            border_style="cyan",
+            padding=(0, 1),
+            expand=False,
+        ))
+
+    console.print("\n[bold green]Проверка завершена.[/bold green]")
+
+
 async def main():
     console.clear()
-
     console.print(f"[bold cyan]DPI Detector v{CURRENT_VERSION}[/bold cyan]")
     console.print(f"[dim]Параллельных запросов: {config.MAX_CONCURRENT}[/dim]")
 
     version_task = asyncio.create_task(_fetch_latest_version())
     latest_version_notified = False
 
-    selection = await ask_test_selection()
-    run_dns     = "1" in selection
-    run_domains = "2" in selection
-    run_tcp     = "3" in selection
-    run_wl_sni  = "4" in selection
+    semaphore = asyncio.Semaphore(config.MAX_CONCURRENT)
 
-    save_to_file = False
-    result_path  = None
-
-    if not _DOCKER_MODE:
-        try:
+    # ── Определяем effective_mode и selection ─────────────────────────────────
+    if _NON_INTERACTIVE:
+        # Режим задан через переменные окружения
+        effective_mode = _RUN_MODE  # once | schedule
+        selection = _resolve_selection_from_env()
+        console.print(f"[dim]Режим: [bold]{effective_mode}[/bold]  Тесты: {selection}[/dim]")
+        if effective_mode == "schedule":
+            interval = int(os.environ.get("CHECK_INTERVAL", "7200"))
+            console.print(f"[dim]Интервал: {interval}s[/dim]")
+    else:
+        # Интерактивный режим: сначала выбор тестов, потом режим запуска
+        selection = await ask_test_selection()
+        effective_mode = await _ask_run_mode_interactive()
+        if effective_mode == "schedule":
+            sys.stdout.write("Интервал в секундах [7200]: ")
+            sys.stdout.flush()
+            try:
+                raw_interval = (await _readline_cancelable()).strip()
+            except KeyboardInterrupt:
+                raise
+            interval = int(raw_interval) if raw_interval.isdigit() else 7200
+        save_to_file = False
+        result_path  = None
+        if effective_mode == "once":
             sys.stdout.write("\nСохранять результаты в файл? [y/N]: ")
             sys.stdout.flush()
-            raw = await _readline_cancelable()
-            raw = raw.strip().lower()
-        except KeyboardInterrupt:
-            raise
-        if raw in ("y", "yes", "д", "да"):
-            save_to_file = True
-            result_path = os.path.join(get_base_dir(), "dpi_detector_results.txt")
+            try:
+                raw = (await _readline_cancelable()).strip().lower()
+            except KeyboardInterrupt:
+                raise
+            if raw in ("y", "yes", "д", "да"):
+                save_to_file = True
+                result_path = os.path.join(get_base_dir(), "dpi_detector_results.txt")
 
-    semaphore = asyncio.Semaphore(config.MAX_CONCURRENT)
+    # ── Основной цикл ─────────────────────────────────────────────────────────
     first_run = True
-
     while True:
-        # ── DNS ───────────────────────────────────────────────────────────────
-        stub_ips: set = set()
-        dns_intercept_count = 0
-
-        if run_dns and config.DNS_CHECK_ENABLED:
-            stub_ips, dns_intercept_count = await check_dns_integrity()
-        elif config.DNS_CHECK_ENABLED and (run_domains or run_tcp):
-            stub_ips = await collect_stub_ips_silently()
-
-        if run_dns and config.DNS_CHECK_ENABLED:
-            total_dns = len(config.DNS_CHECK_DOMAINS)
-            record_dns(
-                total=total_dns,
-                intercepted=dns_intercept_count,
-                ok=total_dns - dns_intercept_count,
-            )
-
-        # ── Домены ────────────────────────────────────────────────────────────
-        domain_stats = None
-        if run_domains:
-            domain_stats = await run_domains_test(semaphore, stub_ips, DOMAINS)
-            record_domains(
-                total=domain_stats["total"],
-                ok=domain_stats["ok"],
-                blocked=domain_stats["blocked"],
-                timeout=domain_stats["timeout"],
-                dns_fail=domain_stats["dns_fail"],
-            )
-
-        # ── TCP 16-20KB ───────────────────────────────────────────────────────
-        tcp_stats = None
-        if run_tcp:
-            tcp_stats = await run_tcp_test(semaphore, TCP_16_20_ITEMS)
-            record_tcp(
-                total=tcp_stats["total"],
-                ok=tcp_stats["ok"],
-                blocked=tcp_stats["blocked"],
-                mixed=tcp_stats["mixed"],
-            )
-
-        # ── Белые SNI ─────────────────────────────────────────────────────────
-        if run_wl_sni:
-            if WHITELIST_SNI:
-                await run_whitelist_sni_test(semaphore, TCP_16_20_ITEMS, WHITELIST_SNI)
-            else:
-                console.print("[yellow]Файл whitelist_sni.txt пуст или не найден — тест 4 пропущен.[/yellow]")
-
-        # ── Обновляем timestamp последнего запуска ────────────────────────────
-        record_run_timestamp()
-
-        # ── Итоговая сводка ───────────────────────────────────────────────────
-        active_tests = sum([run_dns, run_domains, run_tcp, run_wl_sni])
-        if active_tests >= 2:
-            console.print()
-            summary_lines = _format_summary(
-                run_dns, run_domains, run_tcp,
-                dns_intercept_count, domain_stats, tcp_stats,
-            )
-            console.print(Panel(
-                "\n".join(summary_lines),
-                title="[bold]Итог[/bold]",
-                border_style="cyan",
-                padding=(0, 1),
-                expand=False,
-            ))
+        await run_tests(selection, semaphore)
 
         if first_run:
-            print_legend()
+            if not _NON_INTERACTIVE:
+                print_legend()
             first_run = False
 
-        console.print("\n[bold green]Проверка завершена.[/bold green]")
-
-        # ── Уведомление о новой версии ────────────────────────
+        # Уведомление о новой версии
         if not latest_version_notified:
             try:
                 latest = await asyncio.wait_for(asyncio.shield(version_task), timeout=0.1)
@@ -268,23 +320,27 @@ async def main():
             except (asyncio.TimeoutError, Exception):
                 pass
 
-        if save_to_file and result_path:
-            try:
-                with open(result_path, "w", encoding="utf-8") as f:
-                    f.write(console.export_text())
-                console.print(f"[dim]Результаты сохранены: [cyan]{result_path}[/cyan][/dim]")
-            except Exception as e:
-                console.print(f"[yellow]Не удалось сохранить файл: {e}[/yellow]")
+        # ── once: сохранить при необходимости и выйти ─────────────────────────
+        if effective_mode == "once":
+            if not _NON_INTERACTIVE and save_to_file and result_path:
+                try:
+                    with open(result_path, "w", encoding="utf-8") as f:
+                        f.write(console.export_text())
+                    console.print(f"[dim]Результаты сохранены: [cyan]{result_path}[/cyan][/dim]")
+                except Exception as e:
+                    console.print(f"[yellow]Не удалось сохранить файл: {e}[/yellow]")
+            break  # выходим после первого прогона
 
-        # ── В Docker режиме: ждём METRICS_INTERVAL секунд перед повтором ──────
-        if _DOCKER_MODE:
-            interval = int(os.environ.get("CHECK_INTERVAL", "300"))
-            console.print(f"[dim]Docker mode: следующий прогон через {interval}s...[/dim]")
+        # ── schedule: ждём интервал, затем повторяем ──────────────────────────
+        if effective_mode == "schedule":
+            if _NON_INTERACTIVE:
+                interval = int(os.environ.get("CHECK_INTERVAL", "7200"))
+            console.print(f"[dim]Следующий прогон через {interval}s...[/dim]")
             await asyncio.sleep(interval)
             console.print()
             continue
 
-        # ── Предложение повторить ─────────────────────────────────────────────
+        # ── интерактивный once или неизвестный режим: предложить повторить ────
         console.print(
             "\nНажмите [bold green]Enter[/bold green] чтобы повторить проверку "
             "или [bold red]Ctrl+C[/bold red] для выхода"
