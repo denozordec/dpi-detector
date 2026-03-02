@@ -136,6 +136,26 @@ async def _run_phase_with_progress(tasks: list, description: str) -> None:
             progress.update(task_id, completed=completed, description=f"{description} ({completed}/{total})...")
 
 
+def _classify_domain_status(row: list, stub_ips: set) -> str:
+    """Определяет итоговый статус домена по строке таблицы (индексы 1=HTTP, 2=TLS1.2, 3=TLS1.3)."""
+    # DNS FAKE / DNS FAIL
+    if any("DNS FAKE" in str(row[col]) for col in (1, 2, 3)):
+        return "dns_fail"
+    if any("DNS FAIL" in str(row[col]) for col in (1, 2, 3)):
+        return "dns_fail"
+    # Блокировка
+    block_markers = ("TLS DPI", "TLS MITM", "TLS BLOCK", "ISP PAGE", "BLOCKED", "TCP RST", "TCP ABORT")
+    if any(m in str(row[c]) for c in (1, 2, 3) for m in block_markers):
+        return "blocked"
+    # Таймаут
+    if "TIMEOUT" in str(row[3]) or "TIMEOUT" in str(row[2]):
+        return "timeout"
+    # OK
+    if "OK" in str(row[3]) or "OK" in str(row[2]):
+        return "ok"
+    return "unknown"
+
+
 # ── Тест 2: домены ────────────────────────────────────────────────────────────
 
 async def run_domains_test(semaphore: asyncio.Semaphore, stub_ips: set, domains: list) -> dict:
@@ -206,12 +226,20 @@ async def run_domains_test(semaphore: asyncio.Semaphore, stub_ips: set, domains:
         console.print("[yellow]Рекомендация: Настройте DoH/DoT на вашем устройстве, роутере или VPN[/yellow]\n")
 
     block_markers = ("TLS DPI", "TLS MITM", "TLS BLOCK", "ISP PAGE", "BLOCKED", "TCP RST", "TCP ABORT")
+
+    # Build per-domain status dict for Prometheus
+    per_domain: dict = {}
+    for r in rows:
+        domain_name = r[0]  # first column is domain name
+        per_domain[domain_name] = _classify_domain_status(r, stub_ips)
+
     return {
-        "total":    len(domains),
-        "ok":       sum(1 for r in rows if "OK" in r[3] or "OK" in r[2]),
-        "blocked":  sum(1 for r in rows if any(m in r[c] for c in (1,2,3) for m in block_markers)),
-        "timeout":  sum(1 for r in rows if "TIMEOUT" in r[3] or "TIMEOUT" in r[2]),
-        "dns_fail": sum(1 for r in rows if "DNS FAIL" in r[3]),
+        "total":      len(domains),
+        "ok":         sum(1 for r in rows if "OK" in r[3] or "OK" in r[2]),
+        "blocked":    sum(1 for r in rows if any(m in r[c] for c in (1,2,3) for m in block_markers)),
+        "timeout":    sum(1 for r in rows if "TIMEOUT" in r[3] or "TIMEOUT" in r[2]),
+        "dns_fail":   sum(1 for r in rows if "DNS FAIL" in r[3]),
+        "per_domain": per_domain,
     }
 
 
@@ -268,7 +296,13 @@ async def run_tcp_test(semaphore: asyncio.Semaphore, tcp_items: list) -> dict:
     if mixed > 0:
         console.print("[dim]Смешанные результаты указывают на балансировку DPI у провайдера[/dim]")
 
-    return {"total": len(tcp_items), "ok": passed, "blocked": blocked, "mixed": mixed}
+    return {
+        "total":       len(tcp_items),
+        "ok":          passed,
+        "blocked":     blocked,
+        "mixed":       mixed,
+        "raw_results": tcp_results,
+    }
 
 # ── Тест 4: Поиск белых SNI для ASN ──────────────────────────────────────────
 
