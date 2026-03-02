@@ -58,19 +58,32 @@
 
 Запустить тесты один раз и завершить контейнер. Удобно для cron, CI или ручного запуска.
 
+#### Через docker run (готовый образ из ghcr.io)
+
 ```bash
-# Сборка и запуск
-git clone https://github.com/denozordec/dpi-detector.git
-cd dpi-detector
-docker compose run --rm dpi-once
+# Одиночная проверка, тесты 1+2+3
+docker run --rm \
+  -e RUN_MODE=once \
+  -e TESTS=123 \
+  ghcr.io/denozordec/dpi-detector:latest
 ```
 
-Или напрямую через `docker run`:
+С монтированием своих файлов:
 ```bash
 docker run --rm \
   -e RUN_MODE=once \
   -e TESTS=123 \
-  $(docker build -q .)
+  -v $(pwd)/domains.txt:/app/domains.txt \
+  -v $(pwd)/config.py:/app/config.py \
+  ghcr.io/denozordec/dpi-detector:latest
+```
+
+#### Через docker compose (из исходников)
+
+```bash
+git clone https://github.com/denozordec/dpi-detector.git
+cd dpi-detector
+docker compose run --rm dpi-once
 ```
 
 С монтированием своих файлов:
@@ -86,6 +99,42 @@ docker compose run --rm \
 ### 🔁 Режим `schedule` — фоновый демон
 
 Запустить как сервис: тесты повторяются каждые `CHECK_INTERVAL` секунд, метрики доступны на порту 9090 для Prometheus/Grafana.
+
+#### Через docker run (готовый образ из ghcr.io)
+
+```bash
+# Фоновый демон, проверка каждые 2 часа, метрики на :9090
+docker run -d \
+  --name dpi-detector \
+  --restart unless-stopped \
+  -e RUN_MODE=schedule \
+  -e TESTS=123 \
+  -e CHECK_INTERVAL=7200 \
+  -e METRICS_PORT=9090 \
+  -e METRICS_USER=prometheus \
+  -e METRICS_PASSWORD=secret \
+  -p 9090:9090 \
+  ghcr.io/denozordec/dpi-detector:latest
+```
+
+Посмотреть логи:
+```bash
+docker logs -f dpi-detector
+```
+
+Остановить и удалить:
+```bash
+docker stop dpi-detector && docker rm dpi-detector
+```
+
+Обновить образ до последней версии:
+```bash
+docker pull ghcr.io/denozordec/dpi-detector:latest
+docker stop dpi-detector && docker rm dpi-detector
+# затем повторите docker run выше
+```
+
+#### Через docker compose (из исходников)
 
 ```bash
 git clone https://github.com/denozordec/dpi-detector.git
@@ -130,26 +179,23 @@ scrape_configs:
 ```
 
 > [!WARNING]
-> Обязательно смените `METRICS_PASSWORD` в `docker-compose.yml` перед публичным деплоем!
+> Обязательно смените `METRICS_PASSWORD` перед публичным деплоем!
 
 ---
 
 ### ⚡ Быстрые примеры
 
 ```bash
-# Одиночная проверка, тесты 1+2+3
-docker compose run --rm dpi-once
+# Одиночная проверка (CLI, без клонирования репозитория)
+docker run --rm -e RUN_MODE=once -e TESTS=123 ghcr.io/denozordec/dpi-detector:latest
 
 # Одиночная проверка, только DNS + Домены
-docker run --rm -e RUN_MODE=once -e TESTS=12 $(docker build -q .)
+docker run --rm -e RUN_MODE=once -e TESTS=12 ghcr.io/denozordec/dpi-detector:latest
 
 # Фоновый демон, проверка каждый час
-docker run -d \
-  -e RUN_MODE=schedule \
-  -e TESTS=123 \
-  -e CHECK_INTERVAL=3600 \
-  -p 9090:9090 \
-  $(docker build -q .)
+docker run -d --name dpi-detector --restart unless-stopped \
+  -e RUN_MODE=schedule -e TESTS=123 -e CHECK_INTERVAL=3600 \
+  -p 9090:9090 ghcr.io/denozordec/dpi-detector:latest
 
 # Фоновый демон через compose (по умолчанию каждые 2 часа)
 docker compose up -d dpi-schedule
@@ -181,10 +227,10 @@ python dpi_detector.py
 
 ### 🪟 Windows (Готовые сборки)
 
-Скачайте `.exe` в разделе [Releases](https://github.com/Runnin4ik/dpi-detector/releases) оригинального репозитория:
+Скачайте `.exe` в разделе [Releases](https://github.com/denozordec/dpi-detector/releases):
 
-- **[Windows 10 / 11](https://github.com/Runnin4ik/dpi-detector/releases/download/v2.0.1/dpi_detector_v2.0.1_win10.exe)**
-- **[Windows 7 / 8](https://github.com/Runnin4ik/dpi-detector/releases/download/v2.0.1/dpi_detector_v2.0.1_win7.exe)**
+- **Windows 10 / 11** — `dpi_detector_<version>_win10.exe`
+- **Windows 7 / 8** — `dpi_detector_<version>_win7.exe`
 
 Для кастомизации положите `domains.txt`, `tcp16.json`, `config.py`, `whitelist_sni.txt` рядом с `.exe`.
 
