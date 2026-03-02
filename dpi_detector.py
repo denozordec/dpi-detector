@@ -26,7 +26,9 @@ from metrics.prometheus import (
     start_metrics_server,
     record_dns,
     record_domains,
+    record_domain_statuses,
     record_tcp,
+    record_tcp_target_statuses,
     record_run_timestamp,
 )
 
@@ -185,6 +187,42 @@ async def _ask_run_mode_interactive() -> str:
     return "schedule" if raw == "2" else "once"
 
 
+def _build_domain_statuses(domain_stats: Dict, domains: list) -> list:
+    """Build per-domain status list for Prometheus metrics.
+
+    Uses domain_stats keys: per_domain (if present) or falls back to aggregate
+    status inference. Expected domain_stats to contain 'per_domain' dict:
+      {domain: status}  where status in ("ok", "blocked", "timeout", "dns_fail")
+    """
+    per = domain_stats.get("per_domain")
+    if per:
+        return list(per.items())
+    # Fallback: mark all domains with unknown status (shouldn't happen if runners updated)
+    return [(d, "unknown") for d in domains]
+
+
+def _build_tcp_target_statuses(tcp_results_raw: list) -> list:
+    """Convert raw tcp results rows to list of dicts for Prometheus.
+
+    Each row: [id, asn_str, provider, alive_str, status_str, detail]
+    status_str contains 'OK', 'DETECTED', 'MIXED' substrings.
+    """
+    out = []
+    for row in tcp_results_raw:
+        tid, asn_str, provider = row[0], row[1], row[2]
+        status_str = row[4] if len(row) > 4 else ""
+        if "OK" in status_str:
+            status = "ok"
+        elif "DETECTED" in status_str:
+            status = "blocked"
+        elif "MIXED" in status_str:
+            status = "mixed"
+        else:
+            status = "unknown"
+        out.append({"id": tid, "provider": provider, "asn": asn_str, "status": status})
+    return out
+
+
 async def run_tests(selection: str, semaphore: asyncio.Semaphore):
     """Выполняет набор тестов по строке выбора, обновляет метрики."""
     run_dns     = "1" in selection
@@ -218,6 +256,9 @@ async def run_tests(selection: str, semaphore: asyncio.Semaphore):
             timeout=domain_stats["timeout"],
             dns_fail=domain_stats["dns_fail"],
         )
+        # Per-domain labeled metrics
+        domain_statuses = _build_domain_statuses(domain_stats, DOMAINS)
+        record_domain_statuses(domain_statuses)
 
     tcp_stats = None
     if run_tcp:
@@ -228,6 +269,9 @@ async def run_tests(selection: str, semaphore: asyncio.Semaphore):
             blocked=tcp_stats["blocked"],
             mixed=tcp_stats["mixed"],
         )
+        # Per-TCP-target labeled metrics
+        tcp_target_statuses = _build_tcp_target_statuses(tcp_stats.get("raw_results", []))
+        record_tcp_target_statuses(tcp_target_statuses)
 
     if run_wl_sni:
         if WHITELIST_SNI:
@@ -265,7 +309,7 @@ async def main():
 
     semaphore = asyncio.Semaphore(config.MAX_CONCURRENT)
 
-    # ── Определяем effective_mode и selection ─────────────────────────────────
+    # ── Определяем effective_mode и selection ─────────────────────────────────────────────
     if _NON_INTERACTIVE:
         # Режим задан через переменные окружения
         effective_mode = _RUN_MODE  # once | schedule
@@ -299,7 +343,7 @@ async def main():
                 save_to_file = True
                 result_path = os.path.join(get_base_dir(), "dpi_detector_results.txt")
 
-    # ── Основной цикл ─────────────────────────────────────────────────────────
+    # ── Основной цикл ──────────────────────────────────────────────────────────────────
     first_run = True
     while True:
         await run_tests(selection, semaphore)
@@ -320,7 +364,7 @@ async def main():
             except (asyncio.TimeoutError, Exception):
                 pass
 
-        # ── once: сохранить при необходимости и выйти ─────────────────────────
+        # ── once: сохранить при необходимости и выйти ─────────────────────────────
         if effective_mode == "once":
             if not _NON_INTERACTIVE and save_to_file and result_path:
                 try:
@@ -331,7 +375,7 @@ async def main():
                     console.print(f"[yellow]Не удалось сохранить файл: {e}[/yellow]")
             break  # выходим после первого прогона
 
-        # ── schedule: ждём интервал, затем повторяем ──────────────────────────
+        # ── schedule: ждём интервал, затем повторяем ──────────────────────────────
         if effective_mode == "schedule":
             if _NON_INTERACTIVE:
                 interval = int(os.environ.get("CHECK_INTERVAL", "7200"))
@@ -340,7 +384,7 @@ async def main():
             console.print()
             continue
 
-        # ── интерактивный once или неизвестный режим: предложить повторить ────
+        # ── интерактивный once или неизвестный режим: предложить повторить ────────
         console.print(
             "\nНажмите [bold green]Enter[/bold green] чтобы повторить проверку "
             "или [bold red]Ctrl+C[/bold red] для выхода"
