@@ -2,6 +2,8 @@ FROM rust:1.84-bookworm AS builder
 WORKDIR /src
 
 COPY Cargo.toml Cargo.toml
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release
 COPY src/ src/
 RUN cargo build --release
 
