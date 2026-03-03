@@ -1,38 +1,24 @@
-FROM python:3.13-slim
+FROM rust:1.84-bookworm AS builder
+WORKDIR /src
 
+COPY Cargo.toml Cargo.toml
+COPY src/ src/
+RUN cargo build --release
+
+FROM debian:bookworm-slim
 WORKDIR /app
 
-# Оптимизация потребления памяти для Python (glibc)
-ENV MALLOC_ARENA_MAX=2
-ENV PYTHONMALLOC=malloc
-ENV MALLOC_TRIM_THRESHOLD_=131072
-# Отключение буферизации вывода
-ENV PYTHONUNBUFFERED=1
-# Запрет на создание .pyc файлов
-ENV PYTHONDONTWRITEBYTECODE=1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=builder /src/target/release/dpi-detector /app/dpi-detector
+COPY domains.txt /app/domains.txt
+COPY tcp16.json /app/tcp16.json
+COPY whitelist_sni.txt /app/whitelist_sni.txt
 
-COPY cli/ ./cli/
-COPY core/ ./core/
-COPY utils/ ./utils/
-COPY metrics/ ./metrics/
-COPY dpi_detector.py .
-COPY domains.txt .
-COPY tcp16.json .
-COPY config.py .
-COPY whitelist_sni.txt .
-
-# Prometheus metrics port
 EXPOSE 9090
 
-# ---------------------------------------------------------------------------
-# RUN_MODE=once     — запустить тесты один раз и завершить контейнер
-# RUN_MODE=schedule — запускать тесты по расписанию (daemon-режим)
-# TESTS=123         — выбор тестов (1=DNS, 2=Домены, 3=TCP, 4=SNI), по умолчанию 123
-# CHECK_INTERVAL=7200 — интервал между проверками в секундах (для schedule)
-# ---------------------------------------------------------------------------
 ENV RUN_MODE=schedule
 ENV TESTS=123
 ENV CHECK_INTERVAL=7200
@@ -42,4 +28,4 @@ ENV BODY_INSPECT_LIMIT=4096
 # ENV METRICS_USER=prometheus
 # ENV METRICS_PASSWORD=secret
 
-CMD ["python", "dpi_detector.py"]
+CMD ["/app/dpi-detector"]

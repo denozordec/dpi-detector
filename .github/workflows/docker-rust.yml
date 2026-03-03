@@ -1,16 +1,16 @@
-name: Docker CI
+name: Docker CI (rust-rewrite)
 
 on:
   push:
     branches:
-      - main
+      - rust-rewrite-*
 
 permissions:
   contents: read
   packages: write
 
 jobs:
-  build-docker:
+  build-docker-rust:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -36,7 +36,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=sha,prefix=sha-
-            type=raw,value=latest
+            type=raw,value=rust
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5

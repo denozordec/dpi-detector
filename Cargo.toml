@@ -1,0 +1,27 @@
+[package]
+name = "dpi-detector"
+version = "3.0.0"
+edition = "2021"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+futures = "0.3"
+hickory-resolver = { version = "0.24", features = ["dns-over-https-rustls", "tokio-runtime"] }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
+rustls = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

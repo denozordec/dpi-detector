@@ -6,13 +6,13 @@
 </p>
 
 # 🔍 DPI Detector
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Rust](https://img.shields.io/badge/runtime-rust-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](https://github.com/denozordec/dpi-detector)
 
 Инструмент для анализа цензуры трафика в России: обнаруживает и классифицирует блокировки сайтов, хостингов и CDN (TCP16-20 блокировки), а также подмену DNS-запросов провайдером.
 
-> **Fork** от [Runnin4ik/dpi-detector](https://github.com/Runnin4ik/dpi-detector) с расширенными возможностями запуска через Docker.
+> **Fork** от [Runnin4ik/dpi-detector](https://github.com/Runnin4ik/dpi-detector) с переписанным low-RAM runtime на Rust (Tokio + reqwest + hyper + hickory).
 
 ![Пример результатов](https://raw.githubusercontent.com/Runnin4ik/dpi-detector/main/images/screenshot.png)
 
@@ -31,8 +31,7 @@
 
 1. `domains.txt` — список доменов для проверки
 2. `tcp16.json` — цели для теста TCP 16-20KB
-3. `config.py` — конфигурация
-4. `whitelist_sni.txt` — список белых SNI для подбора рабочих
+3. `whitelist_sni.txt` — список белых SNI для подбора рабочих
 
 > [!WARNING]  
 > Если у вас запущены средства обхода блокировок (например, zapret или GoodbyeDPI), результаты тестов будут искажены. Чтобы узнать реальное состояние фильтров вашего провайдера, выключите их перед началом проверки или убедитесь, что они работают в режиме обработки всех пакетов (режим ALL), а не только по списку.
@@ -40,6 +39,10 @@
 ---
 
 ## 🐋 Docker
+
+> [!NOTE]
+> Начиная с этой ветки контейнер запускает Rust-бинарник (`/app/dpi-detector`).
+> Конфигурация задаётся через переменные окружения (`RUN_MODE`, `TESTS`, `CHECK_INTERVAL`, и т.д.).
 
 ### Переменные окружения
 
@@ -76,7 +79,6 @@ docker run --rm \
   -e RUN_MODE=once \
   -e TESTS=123 \
   -v $(pwd)/domains.txt:/app/domains.txt \
-  -v $(pwd)/config.py:/app/config.py \
   ghcr.io/denozordec/dpi-detector:latest
 ```
 
@@ -92,7 +94,6 @@ docker compose run --rm dpi-once
 ```bash
 docker compose run --rm \
   -v $(pwd)/domains.txt:/app/domains.txt \
-  -v $(pwd)/config.py:/app/config.py \
   dpi-once
 ```
 
@@ -160,7 +161,6 @@ services:
   dpi-schedule:
     volumes:
       - ./domains.txt:/app/domains.txt
-      - ./config.py:/app/config.py
 ```
 
 ---
@@ -205,36 +205,23 @@ docker compose up -d dpi-schedule
 
 ---
 
-## 🖥️ Интерактивный запуск (без Docker)
-
-При запуске без переменной `RUN_MODE` скрипт задаёт вопросы в интерактивном режиме.
-
-### Python 3.8+
-
-**Требования:** httpx>=0.28, rich>=14.3
+## 🛠️ Локальный запуск без Docker
 
 ```bash
 git clone https://github.com/denozordec/dpi-detector.git
 cd dpi-detector
-python -m pip install -r requirements.txt
-python dpi_detector.py
+cargo run --release
 ```
 
-После выбора тестов появится вопрос о режиме запуска:
+Примеры:
+
+```bash
+# один прогон
+RUN_MODE=once TESTS=123 cargo run --release
+
+# daemon-режим
+RUN_MODE=schedule TESTS=123 CHECK_INTERVAL=7200 cargo run --release
 ```
-Режим запуска:
-  1 — Одиночная проверка (запустить и выйти)
-  2 — Фоновый режим (повторять по расписанию)
-```
-
-### 🪟 Windows (Готовые сборки)
-
-Скачайте `.exe` в разделе [Releases](https://github.com/denozordec/dpi-detector/releases):
-
-- **Windows 10 / 11** — `dpi_detector_<version>_win10.exe`
-- **Windows 7 / 8** — `dpi_detector_<version>_win7.exe`
-
-Для кастомизации положите `domains.txt`, `tcp16.json`, `config.py`, `whitelist_sni.txt` рядом с `.exe`.
 
 ---
 
