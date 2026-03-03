@@ -11,14 +11,14 @@ use rand::distributions::{Alphanumeric, DistString};
 use reqwest::Client;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, ProtocolVersion, SignatureScheme};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{sleep, timeout, Duration, Instant};
 use tokio_rustls::TlsConnector;
 
 #[derive(Default, Clone)]
@@ -156,6 +156,46 @@ fn render_section_title(title: &str, total: usize, timeout: Duration) {
         total,
         timeout.as_secs_f32()
     );
+}
+
+const BLOCK_MARKERS: &[&str] = &[
+    "lawfilter",
+    "warning.rt.ru",
+    "blocked",
+    "access-denied",
+    "eais",
+    "zapret-info",
+    "rkn.gov.ru",
+    "mvd.ru",
+];
+
+const BODY_BLOCK_MARKERS: &[&str] = &[
+    "blocked",
+    "заблокирован",
+    "запрещён",
+    "запрещен",
+    "ограничен",
+    "единый реестр",
+    "роскомнадзор",
+    "rkn.gov.ru",
+    "nap.gov.ru",
+    "eais.rkn.gov.ru",
+    "warning.rt.ru",
+    "blocklist",
+    "решению суда",
+];
+
+fn build_tls_connector_for(version: ProtocolVersion) -> TlsConnector {
+    let versions: Vec<&'static rustls::SupportedProtocolVersion> = match version {
+        ProtocolVersion::TLSv1_2 => vec![&rustls::version::TLS12],
+        ProtocolVersion::TLSv1_3 => vec![&rustls::version::TLS13],
+        _ => vec![&rustls::version::TLS13],
+    };
+    let cfg = ClientConfig::builder_with_protocol_versions(&versions)
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(cfg))
 }
 
 #[derive(Debug)]
@@ -407,48 +447,84 @@ pub async fn run_dns_check(cfg: &AppConfig) -> (HashSet<String>, i64, i64) {
     (stubs, intercepted, total)
 }
 
-async fn check_https(client: &Client, domain: &str, timeout_dur: Duration, body_limit: usize) -> String {
-    let https_url = format!("https://{domain}");
-    match timeout(timeout_dur, client.get(https_url).send()).await {
-        Ok(Ok(resp)) => {
-            let status = resp.status().as_u16();
-            let location = resp
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_lowercase();
-            if status == 451 {
-                return "BLOCKED".to_string();
-            }
-            if !location.is_empty()
-                && (location.contains("warning.rt.ru")
-                    || location.contains("lawfilter")
-                    || location.contains("rkn.gov.ru")
-                    || location.contains("block"))
-            {
-                return "ISP PAGE".to_string();
-            }
-            if status == 200 {
-                if let Ok(body) = resp.bytes().await {
-                    let inspect_len = body.len().min(body_limit);
-                    let txt = String::from_utf8_lossy(&body[..inspect_len]).to_lowercase();
-                    if txt.contains("blocked")
-                        || txt.contains("роскомнадзор")
-                        || txt.contains("единый реестр")
-                    {
-                        return "ISP PAGE".to_string();
-                    }
-                }
-            }
-            if (200..500).contains(&status) {
-                "OK".to_string()
-            } else {
-                format!("OK {status}")
-            }
-        }
-        Ok(Err(_)) => "TLS BLOCK".to_string(),
-        Err(_) => "TIMEOUT".to_string(),
+fn find_block_marker(s: &str) -> bool {
+    let low = s.to_lowercase();
+    BLOCK_MARKERS.iter().any(|m| low.contains(m)) || BODY_BLOCK_MARKERS.iter().any(|m| low.contains(m))
+}
+
+fn parse_http_status_and_headers(buf: &[u8]) -> (Option<u16>, String) {
+    let txt = String::from_utf8_lossy(buf);
+    let mut lines = txt.lines();
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok());
+    (status, txt.to_string())
+}
+
+async fn check_domain_tls_low_level(
+    domain: &str,
+    tls_version: ProtocolVersion,
+    timeout_dur: Duration,
+    body_limit: usize,
+) -> (String, String, f32) {
+    let start = Instant::now();
+    let resolved = timeout(timeout_dur, tokio::net::lookup_host((domain, 443))).await;
+    let Ok(Ok(mut resolved)) = resolved else {
+        return ("DNS FAIL".to_string(), "Домен не найден".to_string(), start.elapsed().as_secs_f32());
+    };
+    let first = match resolved.next() {
+        Some(a) => a,
+        None => return ("DNS FAIL".to_string(), "Домен не найден".to_string(), start.elapsed().as_secs_f32()),
+    };
+
+    let tcp = match timeout(timeout_dur, TcpStream::connect(first)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(_)) => return ("TLS BLOCK".to_string(), "Connect error".to_string(), start.elapsed().as_secs_f32()),
+        Err(_) => return ("TIMEOUT".to_string(), "Таймаут handshake".to_string(), start.elapsed().as_secs_f32()),
+    };
+
+    let sni = match ServerName::try_from(domain.to_string()) {
+        Ok(v) => v,
+        Err(_) => return ("TLS BLOCK".to_string(), "Invalid SNI".to_string(), start.elapsed().as_secs_f32()),
+    };
+    let connector = build_tls_connector_for(tls_version);
+    let mut stream = match timeout(timeout_dur, connector.connect(sni, tcp)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(_)) => return ("TLS BLOCK".to_string(), "TLS handshake failed".to_string(), start.elapsed().as_secs_f32()),
+        Err(_) => return ("TIMEOUT".to_string(), "Таймаут handshake".to_string(), start.elapsed().as_secs_f32()),
+    };
+
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: {domain}\r\nUser-Agent: dpi-detector-rust/3\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+    );
+    if timeout(timeout_dur, stream.write_all(req.as_bytes())).await.is_err() {
+        return ("TIMEOUT".to_string(), "Write timeout".to_string(), start.elapsed().as_secs_f32());
+    }
+
+    let mut buf = vec![0_u8; body_limit.max(4096)];
+    let n = match timeout(timeout_dur, stream.read(&mut buf)).await {
+        Ok(Ok(v)) if v > 0 => v,
+        Ok(Ok(_)) => return ("TIMEOUT".to_string(), "Read timeout".to_string(), start.elapsed().as_secs_f32()),
+        Ok(Err(_)) => return ("TLS BLOCK".to_string(), "Read error".to_string(), start.elapsed().as_secs_f32()),
+        Err(_) => return ("TIMEOUT".to_string(), "Read timeout".to_string(), start.elapsed().as_secs_f32()),
+    };
+    let (status, header_text) = parse_http_status_and_headers(&buf[..n]);
+    if header_text.to_lowercase().contains("location:") && find_block_marker(&header_text) {
+        return ("ISP PAGE".to_string(), "Редирект на блок-страницу".to_string(), start.elapsed().as_secs_f32());
+    }
+    if find_block_marker(&header_text) {
+        return ("ISP PAGE".to_string(), "Блок-страница в теле".to_string(), start.elapsed().as_secs_f32());
+    }
+    if status == Some(451) {
+        return ("BLOCKED".to_string(), "HTTP 451".to_string(), start.elapsed().as_secs_f32());
+    }
+
+    let elapsed = start.elapsed().as_secs_f32();
+    match status {
+        Some(200..=499) | Some(300..=399) => ("OK".to_string(), String::new(), elapsed),
+        Some(code) => ("OK".to_string(), format!("HTTP {code}"), elapsed),
+        None => ("OK".to_string(), String::new(), elapsed),
     }
 }
 
@@ -466,22 +542,14 @@ async fn check_http(client: &Client, domain: &str, timeout_dur: Duration, body_l
             if status == 451 {
                 return "BLOCKED".to_string();
             }
-            if !location.is_empty()
-                && (location.contains("warning.rt.ru")
-                    || location.contains("lawfilter")
-                    || location.contains("rkn.gov.ru")
-                    || location.contains("block"))
-            {
+            if !location.is_empty() && find_block_marker(&location) {
                 return "ISP PAGE".to_string();
             }
             if status == 200 {
                 if let Ok(body) = resp.bytes().await {
                     let inspect_len = body.len().min(body_limit);
                     let txt = String::from_utf8_lossy(&body[..inspect_len]).to_lowercase();
-                    if txt.contains("blocked")
-                        || txt.contains("роскомнадзор")
-                        || txt.contains("единый реестр")
-                    {
+                    if find_block_marker(&txt) {
                         return "ISP PAGE".to_string();
                     }
                 }
@@ -532,7 +600,14 @@ pub async fn run_domains_check(cfg: &AppConfig, domains: &[String], stub_ips: &H
                         tls13: "dns_fail".to_string(),
                         https: "dns_fail".to_string(),
                     };
-                    return (domain, status, "DNS FAKE".to_string(), "DNS FAKE".to_string(), "DNS FAKE".to_string());
+                    return (
+                        domain,
+                        status,
+                        "DNS FAKE".to_string(),
+                        "DNS FAKE".to_string(),
+                        "DNS FAKE".to_string(),
+                        "DNS подмена".to_string(),
+                    );
                 }
                 if ips.is_empty() {
                     dns_fake_or_fail = true;
@@ -550,17 +625,31 @@ pub async fn run_domains_check(cfg: &AppConfig, domains: &[String], stub_ips: &H
                     tls13: if dns_fail { "dns_fail" } else { "blocked" }.to_string(),
                     https: if dns_fail { "dns_fail" } else { "blocked" }.to_string(),
                 };
-                return (domain, status, "DNS FAIL".to_string(), "DNS FAIL".to_string(), "DNS FAIL".to_string());
+                return (
+                    domain,
+                    status,
+                    "DNS FAIL".to_string(),
+                    "DNS FAIL".to_string(),
+                    "DNS FAIL".to_string(),
+                    "Домен не найден".to_string(),
+                );
             }
 
-            // reqwest не разделяет TLS 1.2/1.3 в простом API, поэтому делаем 2 независимые
-            // HTTPS проверки и сопоставляем их с колонками TLS1.2/TLS1.3.
-            let tls12 = check_https(&client, &domain, timeout_dur, body_limit).await;
-            let tls13 = check_https(&client, &domain, timeout_dur, body_limit).await;
+            let (tls12, d12, t12) =
+                check_domain_tls_low_level(&domain, ProtocolVersion::TLSv1_2, timeout_dur, body_limit).await;
+            let (tls13, d13, t13) =
+                check_domain_tls_low_level(&domain, ProtocolVersion::TLSv1_3, timeout_dur, body_limit).await;
             let http = check_http(&client, &domain, timeout_dur, body_limit).await;
 
             let status = classify_domain_state(&http, &tls12, &tls13);
-            (domain, status, http, tls12, tls13)
+            let detail = if !d12.is_empty() && d12 == d13 {
+                format!("{} | {:.1}s", d12, t12.max(t13))
+            } else if !d12.is_empty() || !d13.is_empty() {
+                format!("T12:{} | T13:{} | {:.1}s", d12, d13, t12.max(t13))
+            } else {
+                format!("{:.1}s", t12.min(t13))
+            };
+            (domain, status, http, tls12, tls13, detail)
         }
     });
 
@@ -577,8 +666,7 @@ pub async fn run_domains_check(cfg: &AppConfig, domains: &[String], stub_ips: &H
     let mut view_rows: Vec<(String, String, String, String, String)> = Vec::with_capacity(rows.len());
 
     render_section_title("[Проверка доступности доменов]", domains.len(), cfg.timeout);
-    for (domain, status, http, tls12, tls13) in rows {
-        let detail = status.https.clone();
+    for (domain, status, http, tls12, tls13, detail) in rows {
         match status.https.as_str() {
             "ok" => ok += 1,
             "blocked" => blocked += 1,
