@@ -13,6 +13,7 @@ strip = true
 anyhow = "1"
 base64 = "0.22"
 bytes = "1"
+comfy-table = "7"
 futures = "0.3"
 hickory-resolver = { version = "0.24", features = ["dns-over-https-rustls", "tokio-runtime"] }
 http = "1"

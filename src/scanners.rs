@@ -4,6 +4,9 @@ use crate::metrics::{
     set_domain_statuses, set_last_run_now, set_metric, set_tcp_target_statuses, DomainStatus, SharedMetrics,
     TcpTargetStatus,
 };
+use comfy_table::{
+    modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Color, ContentArrangement, Table,
+};
 use futures::stream::{self, StreamExt};
 use hickory_resolver::config::*;
 use hickory_resolver::TokioAsyncResolver;
@@ -49,6 +52,35 @@ struct DohResponse {
     status: Option<u32>,
     #[serde(rename = "Answer")]
     answer: Option<Vec<DohAnswer>>,
+}
+
+fn status_cell(value: &str) -> Cell {
+    let upper = value.to_uppercase();
+    if upper.contains("OK") || upper.contains("REDIR") {
+        Cell::new(value).fg(Color::Green).add_attribute(Attribute::Bold)
+    } else if upper.contains("TIMEOUT") || upper.contains("MIXED") {
+        Cell::new(value).fg(Color::Yellow).add_attribute(Attribute::Bold)
+    } else if upper.contains("BLOCK")
+        || upper.contains("DETECTED")
+        || upper.contains("RST")
+        || upper.contains("ABORT")
+        || upper.contains("DNS FAIL")
+        || upper.contains("DNS FAKE")
+        || upper.contains("ISP PAGE")
+    {
+        Cell::new(value).fg(Color::Red).add_attribute(Attribute::Bold)
+    } else {
+        Cell::new(value).fg(Color::White)
+    }
+}
+
+fn render_section_title(title: &str, total: usize, timeout: Duration) {
+    println!(
+        "\n{}  Целей: {} | timeout: {:.1}s",
+        title,
+        total,
+        timeout.as_secs_f32()
+    );
 }
 
 pub async fn run_all_selected(
@@ -157,6 +189,10 @@ pub async fn run_dns_check(cfg: &AppConfig) -> (HashSet<String>, i64, i64) {
     let total = cfg.dns_domains.len() as i64;
     let mut intercepted = 0_i64;
     let mut observed_udp_ips = Vec::new();
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+
+    render_section_title("[Проверка подмены DNS]", cfg.dns_domains.len(), cfg.timeout);
+    println!("Проверяем, перехватывает ли провайдер DNS-запросы...");
 
     for domain in &cfg.dns_domains {
         let udp_ips = resolver
@@ -196,13 +232,30 @@ pub async fn run_dns_check(cfg: &AppConfig) -> (HashSet<String>, i64, i64) {
             }
         }
 
+        let udp_str = if udp_ips.is_empty() {
+            "—".to_string()
+        } else {
+            udp_ips.iter().take(2).cloned().collect::<Vec<_>>().join(", ")
+        };
+        let doh_str = if doh_ips.is_empty() {
+            "—".to_string()
+        } else {
+            doh_ips.iter().take(2).cloned().collect::<Vec<_>>().join(", ")
+        };
+
+        let mut row_status = "DNS OK".to_string();
         if !udp_ips.is_empty() && !doh_ips.is_empty() {
             let u: HashSet<_> = udp_ips.iter().collect();
             let d: HashSet<_> = doh_ips.iter().collect();
             if u != d {
                 intercepted += 1;
+                row_status = "DNS ПОДМЕНА".to_string();
             }
+        } else if udp_ips.is_empty() || doh_ips.is_empty() {
+            row_status = "НЕПОЛНЫЕ ДАННЫЕ".to_string();
         }
+
+        rows.push((domain.to_string(), doh_str, udp_str, row_status));
     }
 
     let mut counts = std::collections::HashMap::<String, usize>::new();
@@ -214,6 +267,26 @@ pub async fn run_dns_check(cfg: &AppConfig) -> (HashSet<String>, i64, i64) {
         .filter_map(|(ip, c)| if c >= 2 { Some(ip) } else { None })
         .collect::<HashSet<_>>();
 
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Домен").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("DoH").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("UDP DNS").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("Статус").fg(Color::Magenta).add_attribute(Attribute::Bold),
+        ]);
+    for (domain, doh, udp, status) in rows {
+        table.add_row(vec![
+            Cell::new(domain).fg(Color::Cyan),
+            Cell::new(doh).fg(Color::White),
+            Cell::new(udp).fg(Color::White),
+            status_cell(&status),
+        ]);
+    }
+    println!("{table}");
     println!("[dns] intercepted {intercepted}/{total}");
     (stubs, intercepted, total)
 }
@@ -385,13 +458,11 @@ pub async fn run_domains_check(cfg: &AppConfig, domains: &[String], stub_ips: &H
     let mut timeout_cnt = 0_i64;
     let mut dns_fail = 0_i64;
     let mut per_domain = Vec::with_capacity(rows.len());
+    let mut view_rows: Vec<(String, String, String, String, String)> = Vec::with_capacity(rows.len());
 
-    println!("\n[domains] Детальные статусы:");
+    render_section_title("[Проверка доступности доменов]", domains.len(), cfg.timeout);
     for (domain, status, http, tls12, tls13) in rows {
-        println!(
-            "- {:<30} HTTP={:<10} TLS1.2={:<10} TLS1.3={:<10} -> {}",
-            domain, http, tls12, tls13, status.https
-        );
+        let detail = status.https.clone();
         match status.https.as_str() {
             "ok" => ok += 1,
             "blocked" => blocked += 1,
@@ -399,8 +470,33 @@ pub async fn run_domains_check(cfg: &AppConfig, domains: &[String], stub_ips: &H
             "dns_fail" => dns_fail += 1,
             _ => {}
         }
+        view_rows.push((domain.clone(), http, tls12, tls13, detail));
         per_domain.push((domain, status));
     }
+
+    view_rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Домен").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("HTTP").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("TLS1.2").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("TLS1.3").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("Детали").fg(Color::Magenta).add_attribute(Attribute::Bold),
+        ]);
+    for (domain, http, tls12, tls13, detail) in view_rows {
+        table.add_row(vec![
+            Cell::new(domain).fg(Color::Cyan),
+            status_cell(&http),
+            status_cell(&tls12),
+            status_cell(&tls13),
+            Cell::new(detail).fg(Color::DarkGrey),
+        ]);
+    }
+    println!("{table}");
 
     println!(
         "[domains] total={total} ok={ok} blocked={blocked} timeout={timeout_cnt} dns_fail={dns_fail}"
@@ -469,7 +565,8 @@ pub async fn run_tcp_check(cfg: &AppConfig, targets: &[TcpTarget]) -> TcpStats {
     let mut per_target = Vec::with_capacity(rows.len());
     let mut raw_rows = Vec::with_capacity(rows.len());
 
-    println!("\n[tcp] Детальные статусы:");
+    render_section_title("[Проверка TCP 16-20KB]", targets.len(), Duration::from_secs(8));
+    let mut table_rows: Vec<(String, String, String, String, String)> = Vec::with_capacity(rows.len());
     for (target, status, detail) in rows {
         let status_key = if status == "OK" {
             ok += 1;
@@ -481,31 +578,55 @@ pub async fn run_tcp_check(cfg: &AppConfig, targets: &[TcpTarget]) -> TcpStats {
             blocked += 1;
             "blocked"
         };
-        println!(
-            "- {:<8} {:<10} {:<22} status={:<8} detail={}",
-            target.id,
-            if target.asn.is_empty() { "-" } else { &target.asn },
-            target.provider,
-            status,
-            if detail.is_empty() { "-" } else { &detail }
-        );
+        let asn_value = if target.asn.is_empty() { "-".to_string() } else { target.asn.clone() };
+        table_rows.push((
+            target.id.clone(),
+            asn_value.clone(),
+            target.provider.clone(),
+            status.clone(),
+            if detail.is_empty() { "-".to_string() } else { detail.clone() },
+        ));
 
         per_target.push((
             target.id.clone(),
             TcpTargetStatus {
                 provider: target.provider.clone(),
-                asn: if target.asn.is_empty() { "-".to_string() } else { target.asn.clone() },
+                asn: asn_value.clone(),
                 status: status_key.to_string(),
             },
         ));
         raw_rows.push(vec![
             target.id,
-            if target.asn.is_empty() { "-".to_string() } else { target.asn },
+            asn_value,
             target.provider,
             status,
             detail,
         ]);
     }
+
+    table_rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("ID").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("ASN").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("Провайдер").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("Статус").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("Детали").fg(Color::Magenta).add_attribute(Attribute::Bold),
+        ]);
+    for (id, asn, provider, status, detail) in table_rows {
+        table.add_row(vec![
+            Cell::new(id).fg(Color::White),
+            Cell::new(asn).fg(Color::Yellow),
+            Cell::new(provider).fg(Color::Cyan),
+            status_cell(&status),
+            Cell::new(detail).fg(Color::DarkGrey),
+        ]);
+    }
+    println!("{table}");
 
     println!("[tcp] total={total} ok={ok} blocked={blocked} mixed={mixed}");
     TcpStats {
@@ -562,6 +683,7 @@ pub async fn run_whitelist_sni_test(cfg: &AppConfig, targets: &[TcpTarget], whit
     let sem = Arc::new(Semaphore::new(cfg.max_concurrent));
     let mut found = 0usize;
     let mut total = 0usize;
+    let mut rows: Vec<(String, String, String)> = Vec::new();
     for (asn_key, target) in blocked_by_asn {
         total += 1;
         let mut selected = String::new();
@@ -581,21 +703,32 @@ pub async fn run_whitelist_sni_test(cfg: &AppConfig, targets: &[TcpTarget], whit
         }
 
         if selected.is_empty() {
-            println!(
-                "- AS={} provider={} -> НЕ НАЙДЕН",
-                asn_key,
-                target.provider
-            );
+            rows.push((asn_key, target.provider, "НЕ НАЙДЕН".to_string()));
         } else {
             found += 1;
-            println!(
-                "- AS={} provider={} -> {}",
-                asn_key,
-                target.provider,
-                selected
-            );
+            rows.push((asn_key, target.provider, selected));
         }
     }
+
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("AS").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("Провайдер").fg(Color::Magenta).add_attribute(Attribute::Bold),
+            Cell::new("WL SNI").fg(Color::Magenta).add_attribute(Attribute::Bold),
+        ]);
+    for (asn, provider, wl_sni) in rows {
+        table.add_row(vec![
+            Cell::new(asn).fg(Color::Yellow),
+            Cell::new(provider).fg(Color::Cyan),
+            status_cell(&wl_sni),
+        ]);
+    }
+    println!("{table}");
 
     println!("[sni] Найдено белых SNI: {found}/{total}");
 }

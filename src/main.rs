@@ -22,10 +22,16 @@ fn base_dir() -> Result<PathBuf> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = AppConfig::from_env();
-    println!(
-        "DPI Detector Rust v3.0.0 | mode={:?} tests={} concurrent={}",
-        cfg.run_mode, cfg.tests, cfg.max_concurrent
-    );
+    let mode_label = match cfg.run_mode {
+        RunMode::Once => "once",
+        RunMode::Schedule => "schedule",
+    };
+    println!("DPI Detector v3.0.0");
+    println!("Параллельных запросов: {}", cfg.max_concurrent);
+    println!("Режим: {}  Тесты: {}", mode_label, cfg.tests);
+    if cfg.run_mode == RunMode::Schedule {
+        println!("Интервал: {}s", cfg.check_interval.as_secs());
+    }
 
     let workdir = base_dir().unwrap_or_else(|_| PathBuf::from("."));
     let domains = load_domains(&workdir.join("domains.txt")).context("domains.txt load failed")?;
