@@ -1,6 +1,13 @@
-FROM python:3.14-alpine
+FROM python:3.13-slim
 
 WORKDIR /app
+
+# Оптимизация потребления памяти для Python (glibc)
+ENV MALLOC_ARENA_MAX=2
+# Отключение буферизации вывода
+ENV PYTHONUNBUFFERED=1
+# Запрет на создание .pyc файлов
+ENV PYTHONDONTWRITEBYTECODE=1
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -31,4 +38,4 @@ ENV METRICS_PORT=9090
 # ENV METRICS_USER=prometheus
 # ENV METRICS_PASSWORD=secret
 
-CMD ["python", "-u", "dpi_detector.py"]
+CMD ["python", "dpi_detector.py"]
