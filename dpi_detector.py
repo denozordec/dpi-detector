@@ -310,6 +310,9 @@ async def main():
     semaphore = asyncio.Semaphore(config.MAX_CONCURRENT)
 
     # ── Определяем effective_mode и selection ─────────────────────────────────────────────
+    save_to_file = False
+    result_path  = None
+
     if _NON_INTERACTIVE:
         # Режим задан через переменные окружения
         effective_mode = _RUN_MODE  # once | schedule
@@ -330,8 +333,6 @@ async def main():
             except KeyboardInterrupt:
                 raise
             interval = int(raw_interval) if raw_interval.isdigit() else 7200
-        save_to_file = False
-        result_path  = None
         if effective_mode == "once":
             sys.stdout.write("\nСохранять результаты в файл? [y/N]: ")
             sys.stdout.flush()
@@ -342,6 +343,13 @@ async def main():
             if raw in ("y", "yes", "д", "да"):
                 save_to_file = True
                 result_path = os.path.join(get_base_dir(), "dpi_detector_results.txt")
+
+    # Устранение утечки памяти: отключаем запись истории (record) в rich.console,
+    # если мы не собираемся сохранять результаты в файл (в schedule буфер будет расти бесконечно).
+    if not save_to_file:
+        console.record = False
+        if hasattr(console, "_record_buffer"):
+            console._record_buffer.clear()
 
     # ── Основной цикл ──────────────────────────────────────────────────────────────────
     first_run = True
