@@ -188,25 +188,15 @@ async def _ask_run_mode_interactive() -> str:
 
 
 def _build_domain_statuses(domain_stats: Dict, domains: list) -> list:
-    """Build per-domain status list for Prometheus metrics.
-
-    Uses domain_stats keys: per_domain (if present) or falls back to aggregate
-    status inference. Expected domain_stats to contain 'per_domain' dict:
-      {domain: status_dict}
-    """
+    """Build per-domain status list for Prometheus metrics."""
     per = domain_stats.get("per_domain")
     if per:
         return list(per.items())
-    # Fallback: mark all domains with unknown status (shouldn't happen if runners updated)
     return [(d, {"https": "unknown", "tls12": "unknown", "tls13": "unknown", "http": "unknown"}) for d in domains]
 
 
 def _build_tcp_target_statuses(tcp_results_raw: list) -> list:
-    """Convert raw tcp results rows to list of dicts for Prometheus.
-
-    Each row: [id, asn_str, provider, alive_str, status_str, detail]
-    status_str contains 'OK', 'DETECTED', 'MIXED' substrings.
-    """
+    """Convert raw tcp results rows to list of dicts for Prometheus."""
     out = []
     for row in tcp_results_raw:
         tid, asn_str, provider = row[0], row[1], row[2]
@@ -256,7 +246,6 @@ async def run_tests(selection: str, semaphore: asyncio.Semaphore):
             timeout=domain_stats["timeout"],
             dns_fail=domain_stats["dns_fail"],
         )
-        # Per-domain labeled metrics
         domain_statuses = _build_domain_statuses(domain_stats, DOMAINS)
         record_domain_statuses(domain_statuses)
 
@@ -269,7 +258,6 @@ async def run_tests(selection: str, semaphore: asyncio.Semaphore):
             blocked=tcp_stats["blocked"],
             mixed=tcp_stats["mixed"],
         )
-        # Per-TCP-target labeled metrics
         tcp_target_statuses = _build_tcp_target_statuses(tcp_stats.get("raw_results", []))
         record_tcp_target_statuses(tcp_target_statuses)
 
@@ -309,20 +297,17 @@ async def main():
 
     semaphore = asyncio.Semaphore(config.MAX_CONCURRENT)
 
-    # ── Определяем effective_mode и selection ─────────────────────────────────────────────
     save_to_file = False
     result_path  = None
 
     if _NON_INTERACTIVE:
-        # Режим задан через переменные окружения
-        effective_mode = _RUN_MODE  # once | schedule
+        effective_mode = _RUN_MODE
         selection = _resolve_selection_from_env()
         console.print(f"[dim]Режим: [bold]{effective_mode}[/bold]  Тесты: {selection}[/dim]")
         if effective_mode == "schedule":
             interval = int(os.environ.get("CHECK_INTERVAL", "7200"))
             console.print(f"[dim]Интервал: {interval}s[/dim]")
     else:
-        # Интерактивный режим: сначала выбор тестов, потом режим запуска
         selection = await ask_test_selection()
         effective_mode = await _ask_run_mode_interactive()
         if effective_mode == "schedule":
@@ -344,14 +329,11 @@ async def main():
                 save_to_file = True
                 result_path = os.path.join(get_base_dir(), "dpi_detector_results.txt")
 
-    # Устранение утечки памяти: отключаем запись истории (record) в rich.console,
-    # если мы не собираемся сохранять результаты в файл (в schedule буфер будет расти бесконечно).
-    if not save_to_file:
-        console.record = False
-        if hasattr(console, "_record_buffer"):
-            console._record_buffer.clear()
+    # Включаем буферизацию вывода только если нужно сохранить результаты в файл.
+    # По умолчанию console.record=False (задано в cli/console.py) — буфер не растёт.
+    if save_to_file:
+        console.record = True
 
-    # ── Основной цикл ──────────────────────────────────────────────────────────────────
     first_run = True
     while True:
         await run_tests(selection, semaphore)
@@ -361,7 +343,6 @@ async def main():
                 print_legend()
             first_run = False
 
-        # Уведомление о новой версии
         if not latest_version_notified:
             try:
                 latest = await asyncio.wait_for(asyncio.shield(version_task), timeout=0.1)
@@ -372,7 +353,6 @@ async def main():
             except (asyncio.TimeoutError, Exception):
                 pass
 
-        # ── once: сохранить при необходимости и выйти ─────────────────────────────
         if effective_mode == "once":
             if not _NON_INTERACTIVE and save_to_file and result_path:
                 try:
@@ -381,9 +361,8 @@ async def main():
                     console.print(f"[dim]Результаты сохранены: [cyan]{result_path}[/cyan][/dim]")
                 except Exception as e:
                     console.print(f"[yellow]Не удалось сохранить файл: {e}[/yellow]")
-            break  # выходим после первого прогона
+            break
 
-        # ── schedule: ждём интервал, затем повторяем ──────────────────────────────
         if effective_mode == "schedule":
             if _NON_INTERACTIVE:
                 interval = int(os.environ.get("CHECK_INTERVAL", "7200"))
@@ -392,7 +371,6 @@ async def main():
             console.print()
             continue
 
-        # ── интерактивный once или неизвестный режим: предложить повторить ────────
         console.print(
             "\nНажмите [bold green]Enter[/bold green] чтобы повторить проверку "
             "или [bold red]Ctrl+C[/bold red] для выхода"

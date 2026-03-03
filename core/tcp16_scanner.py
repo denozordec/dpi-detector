@@ -147,9 +147,6 @@ async def check_tcp_16_20_with_rtt(
 
         limits = httpx.Limits(max_keepalive_connections=1, max_connections=1)
 
-        rtt_samples = []
-        original_sleep = asyncio.sleep
-
         async with httpx.AsyncClient(verify=verify_ctx, http2=False, limits=limits) as client:
             scheme = "http" if port == 80 else "https"
             url = f"{scheme}://{ip}:{port}/"
