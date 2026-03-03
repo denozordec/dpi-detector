@@ -20,13 +20,48 @@ fn default_port() -> u16 {
     443
 }
 
+fn normalize_domain_input(raw: &str) -> Option<String> {
+    let mut s = raw.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Поддержка строк вида "example.com/path" или "https://example.com/path".
+    if !s.contains("://") {
+        s = format!("http://{s}");
+    }
+
+    let without_scheme = match s.split_once("://") {
+        Some((_, rest)) => rest,
+        None => s.as_str(),
+    };
+    let host_port = without_scheme.split('/').next().unwrap_or("").trim();
+    if host_port.is_empty() {
+        return None;
+    }
+
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        // IPv6 в квадратных скобках: [2001:db8::1]:443
+        stripped.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    }
+    .trim();
+
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 pub fn load_domains(path: &Path) -> Result<Vec<String>> {
     let content = fs::read_to_string(path).with_context(|| format!("failed to read {:?}", path))?;
     let domains = content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(ToOwned::to_owned)
+        .filter_map(normalize_domain_input)
         .collect::<Vec<_>>();
     Ok(domains)
 }
