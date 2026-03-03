@@ -18,6 +18,23 @@ use tokio::sync::RwLock;
 pub struct MetricsState {
     pub numbers: HashMap<&'static str, i64>,
     pub last_run_ts: f64,
+    pub domain_status: HashMap<String, DomainStatus>,
+    pub tcp_target_status: HashMap<String, TcpTargetStatus>,
+}
+
+#[derive(Default, Clone)]
+pub struct DomainStatus {
+    pub http: String,
+    pub tls12: String,
+    pub tls13: String,
+    pub https: String,
+}
+
+#[derive(Default, Clone)]
+pub struct TcpTargetStatus {
+    pub provider: String,
+    pub asn: String,
+    pub status: String,
 }
 
 pub type SharedMetrics = Arc<RwLock<MetricsState>>;
@@ -40,6 +57,26 @@ pub async fn set_last_run_now(metrics: &SharedMetrics) {
     m.last_run_ts = now;
 }
 
+pub async fn set_domain_statuses(metrics: &SharedMetrics, statuses: Vec<(String, DomainStatus)>) {
+    let mut m = metrics.write().await;
+    m.domain_status.clear();
+    for (domain, status) in statuses {
+        m.domain_status.insert(domain, status);
+    }
+}
+
+pub async fn set_tcp_target_statuses(metrics: &SharedMetrics, statuses: Vec<(String, TcpTargetStatus)>) {
+    let mut m = metrics.write().await;
+    m.tcp_target_status.clear();
+    for (target_id, status) in statuses {
+        m.tcp_target_status.insert(target_id, status);
+    }
+}
+
+fn escape_label(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
 fn render(m: &MetricsState) -> String {
     let mut lines = Vec::new();
     let names = [
@@ -50,9 +87,11 @@ fn render(m: &MetricsState) -> String {
         ("dpi_domains_ok", "Domains accessible"),
         ("dpi_domains_blocked", "Domains blocked"),
         ("dpi_domains_timeout", "Domains timed out"),
+        ("dpi_domains_dns_fail", "Domains with DNS resolution failure"),
         ("dpi_tcp_total", "Total TCP probes"),
         ("dpi_tcp_ok", "TCP probes passed"),
         ("dpi_tcp_blocked", "TCP probes blocked"),
+        ("dpi_tcp_mixed", "TCP probes with mixed results"),
     ];
 
     for (name, help) in names {
@@ -66,6 +105,74 @@ fn render(m: &MetricsState) -> String {
     lines.push("# HELP dpi_last_run_timestamp_seconds Unix timestamp of last completed test run".to_string());
     lines.push("# TYPE dpi_last_run_timestamp_seconds gauge".to_string());
     lines.push(format!("dpi_last_run_timestamp_seconds {:.3}", m.last_run_ts));
+
+    if !m.domain_status.is_empty() {
+        lines.push("# HELP dpi_domain_available Per-domain availability status (HTTPS overall, 1=current state)".to_string());
+        lines.push("# TYPE dpi_domain_available gauge".to_string());
+        let mut items = m.domain_status.iter().collect::<Vec<_>>();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        for (domain, st) in &items {
+            lines.push(format!(
+                "dpi_domain_available{{domain=\"{}\",status=\"{}\"}} 1",
+                escape_label(domain),
+                escape_label(&st.https)
+            ));
+        }
+
+        lines.push("# HELP dpi_domain_ok Per-domain reachability: 1=ok, 0=not ok".to_string());
+        lines.push("# TYPE dpi_domain_ok gauge".to_string());
+        for (domain, st) in &items {
+            let ok = if st.https == "ok" { 1 } else { 0 };
+            lines.push(format!(
+                "dpi_domain_ok{{domain=\"{}\"}} {ok}",
+                escape_label(domain),
+            ));
+        }
+
+        lines.push("# HELP dpi_domain_tls_status Per-domain TLS version status".to_string());
+        lines.push("# TYPE dpi_domain_tls_status gauge".to_string());
+        for (domain, st) in &items {
+            lines.push(format!(
+                "dpi_domain_tls_status{{domain=\"{}\",tls_version=\"1.2\",status=\"{}\"}} 1",
+                escape_label(domain),
+                escape_label(&st.tls12)
+            ));
+            lines.push(format!(
+                "dpi_domain_tls_status{{domain=\"{}\",tls_version=\"1.3\",status=\"{}\"}} 1",
+                escape_label(domain),
+                escape_label(&st.tls13)
+            ));
+        }
+    }
+
+    if !m.tcp_target_status.is_empty() {
+        lines.push("# HELP dpi_tcp_target_status Per-TCP-target DPI status (1=current state)".to_string());
+        lines.push("# TYPE dpi_tcp_target_status gauge".to_string());
+        let mut items = m.tcp_target_status.iter().collect::<Vec<_>>();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        for (tid, st) in &items {
+            lines.push(format!(
+                "dpi_tcp_target_status{{id=\"{}\",provider=\"{}\",asn=\"{}\",status=\"{}\"}} 1",
+                escape_label(tid),
+                escape_label(&st.provider),
+                escape_label(&st.asn),
+                escape_label(&st.status)
+            ));
+        }
+
+        lines.push("# HELP dpi_tcp_target_ok Per-TCP-target: 1=ok (DPI not detected), 0=blocked/mixed".to_string());
+        lines.push("# TYPE dpi_tcp_target_ok gauge".to_string());
+        for (tid, st) in &items {
+            let ok = if st.status == "ok" { 1 } else { 0 };
+            lines.push(format!(
+                "dpi_tcp_target_ok{{id=\"{}\",provider=\"{}\",asn=\"{}\"}} {ok}",
+                escape_label(tid),
+                escape_label(&st.provider),
+                escape_label(&st.asn)
+            ));
+        }
+    }
+
     lines.join("\n") + "\n"
 }
 

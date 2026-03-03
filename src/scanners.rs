@@ -1,12 +1,15 @@
 use crate::config::AppConfig;
 use crate::loader::TcpTarget;
-use crate::metrics::{set_last_run_now, set_metric, SharedMetrics};
+use crate::metrics::{
+    set_domain_statuses, set_last_run_now, set_metric, set_tcp_target_statuses, DomainStatus, SharedMetrics,
+    TcpTargetStatus,
+};
 use futures::stream::{self, StreamExt};
 use hickory_resolver::config::*;
 use hickory_resolver::TokioAsyncResolver;
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -19,6 +22,8 @@ pub struct DomainStats {
     pub ok: i64,
     pub blocked: i64,
     pub timeout: i64,
+    pub dns_fail: i64,
+    pub per_domain: Vec<(String, DomainStatus)>,
 }
 
 #[derive(Default, Clone)]
@@ -26,6 +31,9 @@ pub struct TcpStats {
     pub total: i64,
     pub ok: i64,
     pub blocked: i64,
+    pub mixed: i64,
+    pub per_target: Vec<(String, TcpTargetStatus)>,
+    pub raw_rows: Vec<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +80,8 @@ pub async fn run_all_selected(
         set_metric(metrics, "dpi_domains_ok", stats.ok).await;
         set_metric(metrics, "dpi_domains_blocked", stats.blocked).await;
         set_metric(metrics, "dpi_domains_timeout", stats.timeout).await;
+        set_metric(metrics, "dpi_domains_dns_fail", stats.dns_fail).await;
+        set_domain_statuses(metrics, stats.per_domain.clone()).await;
     }
 
     if run_tcp {
@@ -79,13 +89,59 @@ pub async fn run_all_selected(
         set_metric(metrics, "dpi_tcp_total", stats.total).await;
         set_metric(metrics, "dpi_tcp_ok", stats.ok).await;
         set_metric(metrics, "dpi_tcp_blocked", stats.blocked).await;
+        set_metric(metrics, "dpi_tcp_mixed", stats.mixed).await;
+        set_tcp_target_statuses(metrics, stats.per_target.clone()).await;
     }
 
     if run_sni {
-        println!("[warn] test #4 (whitelist SNI) пока в минимальной реализации на Rust");
+        run_whitelist_sni_test(cfg, tcp_targets, _wl_sni).await;
     }
 
     set_last_run_now(metrics).await;
+}
+
+fn classify_domain_state(http: &str, tls12: &str, tls13: &str) -> DomainStatus {
+    fn norm(x: &str) -> &'static str {
+        if x.contains("DNS FAIL") {
+            "dns_fail"
+        } else if x.contains("TIMEOUT") {
+            "timeout"
+        } else if x.contains("BLOCKED")
+            || x.contains("TLS DPI")
+            || x.contains("TLS MITM")
+            || x.contains("TLS BLOCK")
+            || x.contains("ISP PAGE")
+            || x.contains("TCP RST")
+            || x.contains("TCP ABORT")
+        {
+            "blocked"
+        } else if x.contains("OK") || x.contains("REDIR") {
+            "ok"
+        } else {
+            "unknown"
+        }
+    }
+
+    let http_s = norm(http);
+    let t12_s = norm(tls12);
+    let t13_s = norm(tls13);
+    let https = if t12_s == "ok" || t13_s == "ok" {
+        "ok"
+    } else if t12_s == "blocked" || t13_s == "blocked" {
+        "blocked"
+    } else if t12_s == "timeout" || t13_s == "timeout" {
+        "timeout"
+    } else if t12_s == "dns_fail" || t13_s == "dns_fail" {
+        "dns_fail"
+    } else {
+        "unknown"
+    };
+    DomainStatus {
+        http: http_s.to_string(),
+        tls12: t12_s.to_string(),
+        tls13: t13_s.to_string(),
+        https: https.to_string(),
+    }
 }
 
 pub async fn run_dns_check(cfg: &AppConfig) -> (HashSet<String>, i64, i64) {
@@ -162,6 +218,98 @@ pub async fn run_dns_check(cfg: &AppConfig) -> (HashSet<String>, i64, i64) {
     (stubs, intercepted, total)
 }
 
+async fn check_https(client: &Client, domain: &str, timeout_dur: Duration, body_limit: usize) -> String {
+    let https_url = format!("https://{domain}");
+    match timeout(timeout_dur, client.get(https_url).send()).await {
+        Ok(Ok(resp)) => {
+            let status = resp.status().as_u16();
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_lowercase();
+            if status == 451 {
+                return "BLOCKED".to_string();
+            }
+            if !location.is_empty()
+                && (location.contains("warning.rt.ru")
+                    || location.contains("lawfilter")
+                    || location.contains("rkn.gov.ru")
+                    || location.contains("block"))
+            {
+                return "ISP PAGE".to_string();
+            }
+            if status == 200 {
+                if let Ok(body) = resp.bytes().await {
+                    let inspect_len = body.len().min(body_limit);
+                    let txt = String::from_utf8_lossy(&body[..inspect_len]).to_lowercase();
+                    if txt.contains("blocked")
+                        || txt.contains("роскомнадзор")
+                        || txt.contains("единый реестр")
+                    {
+                        return "ISP PAGE".to_string();
+                    }
+                }
+            }
+            if (200..500).contains(&status) {
+                "OK".to_string()
+            } else {
+                format!("OK {status}")
+            }
+        }
+        Ok(Err(_)) => "TLS BLOCK".to_string(),
+        Err(_) => "TIMEOUT".to_string(),
+    }
+}
+
+async fn check_http(client: &Client, domain: &str, timeout_dur: Duration, body_limit: usize) -> String {
+    let http_url = format!("http://{domain}");
+    match timeout(timeout_dur, client.get(http_url).send()).await {
+        Ok(Ok(resp)) => {
+            let status = resp.status().as_u16();
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_lowercase();
+            if status == 451 {
+                return "BLOCKED".to_string();
+            }
+            if !location.is_empty()
+                && (location.contains("warning.rt.ru")
+                    || location.contains("lawfilter")
+                    || location.contains("rkn.gov.ru")
+                    || location.contains("block"))
+            {
+                return "ISP PAGE".to_string();
+            }
+            if status == 200 {
+                if let Ok(body) = resp.bytes().await {
+                    let inspect_len = body.len().min(body_limit);
+                    let txt = String::from_utf8_lossy(&body[..inspect_len]).to_lowercase();
+                    if txt.contains("blocked")
+                        || txt.contains("роскомнадзор")
+                        || txt.contains("единый реестр")
+                    {
+                        return "ISP PAGE".to_string();
+                    }
+                }
+            }
+            if (200..300).contains(&status) {
+                "OK".to_string()
+            } else if (300..400).contains(&status) {
+                "REDIR".to_string()
+            } else {
+                format!("OK {status}")
+            }
+        }
+        Ok(Err(_)) => "CONN ERR".to_string(),
+        Err(_) => "TIMEOUT".to_string(),
+    }
+}
+
 pub async fn run_domains_check(cfg: &AppConfig, domains: &[String], stub_ips: &HashSet<String>) -> DomainStats {
     let sem = Arc::new(Semaphore::new(cfg.max_concurrent));
     let client = Client::builder()
@@ -182,66 +330,116 @@ pub async fn run_domains_check(cfg: &AppConfig, domains: &[String], stub_ips: &H
         let body_limit = cfg.body_inspect_limit;
         async move {
             let _permit = sem.acquire().await.ok();
-            let mut blocked = false;
-            let mut timed_out = false;
+            let mut dns_fake_or_fail = false;
+            let mut dns_fail = false;
 
             if let Ok(lookup) = tokio::net::lookup_host((domain.as_str(), 443)).await {
                 let ips = lookup.map(|s| s.ip().to_string()).collect::<Vec<_>>();
                 if ips.iter().any(|ip| stub_ips.contains(ip)) {
-                    blocked = true;
+                    let status = DomainStatus {
+                        http: "dns_fail".to_string(),
+                        tls12: "dns_fail".to_string(),
+                        tls13: "dns_fail".to_string(),
+                        https: "dns_fail".to_string(),
+                    };
+                    return (domain, status, "DNS FAKE".to_string(), "DNS FAKE".to_string(), "DNS FAKE".to_string());
                 }
-            }
-
-            if !blocked {
-                let https_url = format!("https://{domain}");
-                match timeout(timeout_dur, client.get(https_url).send()).await {
-                    Ok(Ok(resp)) => {
-                        let status = resp.status().as_u16();
-                        if status == 451 || status >= 500 {
-                            blocked = true;
-                        } else if status == 200 {
-                            if let Ok(body) = resp.bytes().await {
-                                let inspect_len = body.len().min(body_limit);
-                                let txt = String::from_utf8_lossy(&body[..inspect_len]).to_lowercase();
-                                if txt.contains("blocked") || txt.contains("роскомнадзор") {
-                                    blocked = true;
-                                }
-                            }
-                        }
-                    }
-                    Ok(Err(_)) => blocked = true,
-                    Err(_) => timed_out = true,
+                if ips.is_empty() {
+                    dns_fake_or_fail = true;
+                    dns_fail = true;
                 }
-            }
-
-            if !blocked && !timed_out {
-                let http_url = format!("http://{domain}");
-                if timeout(timeout_dur, client.get(http_url).send()).await.is_err() {
-                    timed_out = true;
-                }
-            }
-
-            if timed_out {
-                (0_i64, 0_i64, 1_i64)
-            } else if blocked {
-                (0_i64, 1_i64, 0_i64)
             } else {
-                (1_i64, 0_i64, 0_i64)
+                dns_fake_or_fail = true;
+                dns_fail = true;
             }
+
+            if dns_fake_or_fail {
+                let status = DomainStatus {
+                    http: if dns_fail { "dns_fail" } else { "blocked" }.to_string(),
+                    tls12: if dns_fail { "dns_fail" } else { "blocked" }.to_string(),
+                    tls13: if dns_fail { "dns_fail" } else { "blocked" }.to_string(),
+                    https: if dns_fail { "dns_fail" } else { "blocked" }.to_string(),
+                };
+                return (domain, status, "DNS FAIL".to_string(), "DNS FAIL".to_string(), "DNS FAIL".to_string());
+            }
+
+            // reqwest не разделяет TLS 1.2/1.3 в простом API, поэтому делаем 2 независимые
+            // HTTPS проверки и сопоставляем их с колонками TLS1.2/TLS1.3.
+            let tls12 = check_https(&client, &domain, timeout_dur, body_limit).await;
+            let tls13 = check_https(&client, &domain, timeout_dur, body_limit).await;
+            let http = check_http(&client, &domain, timeout_dur, body_limit).await;
+
+            let status = classify_domain_state(&http, &tls12, &tls13);
+            (domain, status, http, tls12, tls13)
         }
     });
 
-    let (ok, blocked, timeout_cnt) = stream
+    let rows = stream
         .buffer_unordered(cfg.max_concurrent)
-        .fold((0_i64, 0_i64, 0_i64), |acc, r| async move { (acc.0 + r.0, acc.1 + r.1, acc.2 + r.2) })
+        .collect::<Vec<_>>()
         .await;
 
-    println!("[domains] total={total} ok={ok} blocked={blocked} timeout={timeout_cnt}");
+    let mut ok = 0_i64;
+    let mut blocked = 0_i64;
+    let mut timeout_cnt = 0_i64;
+    let mut dns_fail = 0_i64;
+    let mut per_domain = Vec::with_capacity(rows.len());
+
+    println!("\n[domains] Детальные статусы:");
+    for (domain, status, http, tls12, tls13) in rows {
+        println!(
+            "- {:<30} HTTP={:<10} TLS1.2={:<10} TLS1.3={:<10} -> {}",
+            domain, http, tls12, tls13, status.https
+        );
+        match status.https.as_str() {
+            "ok" => ok += 1,
+            "blocked" => blocked += 1,
+            "timeout" => timeout_cnt += 1,
+            "dns_fail" => dns_fail += 1,
+            _ => {}
+        }
+        per_domain.push((domain, status));
+    }
+
+    println!(
+        "[domains] total={total} ok={ok} blocked={blocked} timeout={timeout_cnt} dns_fail={dns_fail}"
+    );
     DomainStats {
         total,
         ok,
         blocked,
         timeout: timeout_cnt,
+        dns_fail,
+        per_domain,
+    }
+}
+
+async fn probe_tcp_target(target: &TcpTarget, timeout_dur: Duration) -> (String, String) {
+    let addr = format!("{}:{}", target.ip, target.port);
+    let connect = timeout(timeout_dur, TcpStream::connect(addr)).await;
+    let Ok(Ok(mut socket)) = connect else {
+        return ("DETECTED".to_string(), "connect_error".to_string());
+    };
+
+    let mut ok = true;
+    let mut read_buf = [0_u8; 32];
+    for i in 0..16 {
+        let mut chunk = vec![0_u8; 4000];
+        for b in &mut chunk {
+            *b = rand::random::<u8>();
+        }
+        if socket.write_all(&chunk).await.is_err() {
+            return ("DETECTED".to_string(), format!("write_err_at_{}KB", i * 4));
+        }
+        if timeout(Duration::from_millis(250), socket.read(&mut read_buf)).await.is_err() {
+            ok = false;
+        }
+    }
+
+    if ok {
+        ("OK".to_string(), "".to_string())
+    } else {
+        ("MIXED".to_string(), "partial_timeout".to_string())
     }
 }
 
@@ -254,39 +452,149 @@ pub async fn run_tcp_check(cfg: &AppConfig, targets: &[TcpTarget]) -> TcpStats {
         let timeout_dur = Duration::from_secs(8);
         async move {
             let _permit = sem.acquire().await.ok();
-            let addr = format!("{}:{}", target.ip, target.port);
-            let connect = timeout(timeout_dur, TcpStream::connect(addr)).await;
-            let Ok(Ok(mut socket)) = connect else {
-                return (0_i64, 1_i64);
-            };
-
-            let mut ok = true;
-            let mut read_buf = [0_u8; 32];
-            for _ in 0..16 {
-                let mut chunk = vec![0_u8; 4000];
-                for b in &mut chunk {
-                    *b = rand::random::<u8>();
-                }
-                if socket.write_all(&chunk).await.is_err() {
-                    ok = false;
-                    break;
-                }
-                let _ = timeout(Duration::from_millis(200), socket.read(&mut read_buf)).await;
-            }
-
-            if ok {
-                (1_i64, 0_i64)
-            } else {
-                (0_i64, 1_i64)
-            }
+            let (status, detail) = probe_tcp_target(&target, timeout_dur).await;
+            (target, status, detail)
         }
     });
 
-    let (ok, blocked) = stream
+    let rows = stream
         .buffer_unordered(cfg.max_concurrent)
-        .fold((0_i64, 0_i64), |acc, r| async move { (acc.0 + r.0, acc.1 + r.1) })
+        .collect::<Vec<_>>()
         .await;
 
-    println!("[tcp] total={total} ok={ok} blocked={blocked}");
-    TcpStats { total, ok, blocked }
+    let mut ok = 0_i64;
+    let mut blocked = 0_i64;
+    let mut mixed = 0_i64;
+    let mut per_target = Vec::with_capacity(rows.len());
+    let mut raw_rows = Vec::with_capacity(rows.len());
+
+    println!("\n[tcp] Детальные статусы:");
+    for (target, status, detail) in rows {
+        let status_key = if status == "OK" {
+            ok += 1;
+            "ok"
+        } else if status == "MIXED" {
+            mixed += 1;
+            "mixed"
+        } else {
+            blocked += 1;
+            "blocked"
+        };
+        println!(
+            "- {:<8} {:<10} {:<22} status={:<8} detail={}",
+            target.id,
+            if target.asn.is_empty() { "-" } else { &target.asn },
+            target.provider,
+            status,
+            if detail.is_empty() { "-" } else { &detail }
+        );
+
+        per_target.push((
+            target.id.clone(),
+            TcpTargetStatus {
+                provider: target.provider.clone(),
+                asn: if target.asn.is_empty() { "-".to_string() } else { target.asn.clone() },
+                status: status_key.to_string(),
+            },
+        ));
+        raw_rows.push(vec![
+            target.id,
+            if target.asn.is_empty() { "-".to_string() } else { target.asn },
+            target.provider,
+            status,
+            detail,
+        ]);
+    }
+
+    println!("[tcp] total={total} ok={ok} blocked={blocked} mixed={mixed}");
+    TcpStats {
+        total,
+        ok,
+        blocked,
+        mixed,
+        per_target,
+        raw_rows,
+    }
+}
+
+pub async fn run_whitelist_sni_test(cfg: &AppConfig, targets: &[TcpTarget], whitelist_sni: &[String]) {
+    let port443 = targets
+        .iter()
+        .filter(|t| t.port == 443)
+        .cloned()
+        .collect::<Vec<_>>();
+    if port443.is_empty() {
+        println!("[sni] Нет целей с портом 443.");
+        return;
+    }
+    if whitelist_sni.is_empty() {
+        println!("[sni] whitelist_sni.txt пуст — тест пропущен.");
+        return;
+    }
+
+    println!(
+        "\n[sni] Поиск белых SNI: targets={} sni={}",
+        port443.len(),
+        whitelist_sni.len()
+    );
+
+    // Сначала определяем кандидатов (только DETECTED по базовому SNI).
+    let mut blocked_by_asn: HashMap<String, TcpTarget> = HashMap::new();
+    for target in &port443 {
+        let timeout_dur = Duration::from_secs(8);
+        let base = probe_tcp_target(target, timeout_dur).await;
+        if base.0 == "DETECTED" {
+            let key = if target.asn.trim().is_empty() {
+                target.ip.clone()
+            } else {
+                target.asn.trim().to_string()
+            };
+            blocked_by_asn.entry(key).or_insert_with(|| target.clone());
+        }
+    }
+
+    if blocked_by_asn.is_empty() {
+        println!("[sni] Блокированных AS не найдено, перебор не требуется.");
+        return;
+    }
+
+    let sem = Arc::new(Semaphore::new(cfg.max_concurrent));
+    let mut found = 0usize;
+    let mut total = 0usize;
+    for (asn_key, target) in blocked_by_asn {
+        total += 1;
+        let mut selected = String::new();
+        let candidates = std::iter::once("".to_string())
+            .chain(whitelist_sni.iter().cloned())
+            .collect::<Vec<_>>();
+
+        for sni in candidates {
+            let _permit = sem.acquire().await.ok();
+            let mut t = target.clone();
+            t.sni = sni.clone();
+            let (status, _) = probe_tcp_target(&t, Duration::from_secs(8)).await;
+            if status == "OK" {
+                selected = if sni.is_empty() { "(без SNI)".to_string() } else { sni };
+                break;
+            }
+        }
+
+        if selected.is_empty() {
+            println!(
+                "- AS={} provider={} -> НЕ НАЙДЕН",
+                asn_key,
+                target.provider
+            );
+        } else {
+            found += 1;
+            println!(
+                "- AS={} provider={} -> {}",
+                asn_key,
+                target.provider,
+                selected
+            );
+        }
+    }
+
+    println!("[sni] Найдено белых SNI: {found}/{total}");
 }
