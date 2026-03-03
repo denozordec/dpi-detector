@@ -332,8 +332,9 @@ pub async fn run_domains_check(cfg: &AppConfig, domains: &[String], stub_ips: &H
             let _permit = sem.acquire().await.ok();
             let mut dns_fake_or_fail = false;
             let mut dns_fail = false;
+            let domain_for_lookup = domain.clone();
 
-            if let Ok(lookup) = tokio::net::lookup_host((domain.as_str(), 443)).await {
+            if let Ok(lookup) = tokio::net::lookup_host((domain_for_lookup.as_str(), 443)).await {
                 let ips = lookup.map(|s| s.ip().to_string()).collect::<Vec<_>>();
                 if ips.iter().any(|ip| stub_ips.contains(ip)) {
                     let status = DomainStatus {
