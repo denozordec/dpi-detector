@@ -7,14 +7,19 @@ use crate::metrics::{
 use futures::stream::{self, StreamExt};
 use hickory_resolver::config::*;
 use hickory_resolver::TokioAsyncResolver;
+use rand::distributions::{Alphanumeric, DistString};
 use reqwest::Client;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
+use tokio_rustls::TlsConnector;
 
 #[derive(Default, Clone)]
 pub struct DomainStats {
@@ -151,6 +156,62 @@ fn render_section_title(title: &str, total: usize, timeout: Duration) {
         total,
         timeout.as_secs_f32()
     );
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
+}
+
+fn build_dangerous_tls_connector() -> TlsConnector {
+    let config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
 }
 
 pub async fn run_all_selected(
@@ -554,32 +615,120 @@ pub async fn run_domains_check(cfg: &AppConfig, domains: &[String], stub_ips: &H
     }
 }
 
-async fn probe_tcp_target(target: &TcpTarget, timeout_dur: Duration) -> (String, String) {
-    let addr = format!("{}:{}", target.ip, target.port);
-    let connect = timeout(timeout_dur, TcpStream::connect(addr)).await;
-    let Ok(Ok(mut socket)) = connect else {
-        return ("DETECTED".to_string(), "connect_error".to_string());
-    };
+async fn run_fat_sequence<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    host: &str,
+    timeout_dur: Duration,
+) -> (String, String, String) {
+    let mut alive = false;
+    let mut read_buf = [0_u8; 1024];
 
-    let mut ok = true;
-    let mut read_buf = [0_u8; 32];
     for i in 0..16 {
-        let mut chunk = vec![0_u8; 4000];
-        for b in &mut chunk {
-            *b = rand::random::<u8>();
+        let mut request = format!(
+            "HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: dpi-detector-rust/3\r\nConnection: keep-alive\r\n"
+        );
+        if i > 0 {
+            let pad = Alphanumeric.sample_string(&mut rand::thread_rng(), 4000);
+            request.push_str(&format!("X-Pad: {pad}\r\n"));
         }
-        if socket.write_all(&chunk).await.is_err() {
-            return ("DETECTED".to_string(), format!("write_err_at_{}KB", i * 4));
+        request.push_str("\r\n");
+
+        match timeout(timeout_dur, stream.write_all(request.as_bytes())).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                if i == 0 {
+                    return ("Нет".to_string(), "ERR".to_string(), "connect_error".to_string());
+                }
+                let alive_str = if alive { "Да" } else { "Нет" };
+                return (
+                    alive_str.to_string(),
+                    "DETECTED".to_string(),
+                    format!("Conn Err at {}KB", i * 4),
+                );
+            }
+            Err(_) => {
+                if i == 0 {
+                    return ("Нет".to_string(), "ERR".to_string(), "timeout".to_string());
+                }
+                let alive_str = if alive { "Да" } else { "Нет" };
+                return (
+                    alive_str.to_string(),
+                    "DETECTED".to_string(),
+                    format!("Blackhole at {}KB", i * 4),
+                );
+            }
         }
-        if timeout(Duration::from_millis(250), socket.read(&mut read_buf)).await.is_err() {
-            ok = false;
+
+        match timeout(timeout_dur, stream.read(&mut read_buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                if i == 0 {
+                    alive = true;
+                }
+            }
+            Ok(Ok(_)) | Ok(Err(_)) => {
+                if i == 0 {
+                    return ("Нет".to_string(), "ERR".to_string(), "read_error".to_string());
+                }
+                let alive_str = if alive { "Да" } else { "Нет" };
+                return (
+                    alive_str.to_string(),
+                    "DETECTED".to_string(),
+                    format!("Conn Err at {}KB", i * 4),
+                );
+            }
+            Err(_) => {
+                if i == 0 {
+                    return ("Нет".to_string(), "ERR".to_string(), "timeout".to_string());
+                }
+                let alive_str = if alive { "Да" } else { "Нет" };
+                return (
+                    alive_str.to_string(),
+                    "DETECTED".to_string(),
+                    format!("Blackhole at {}KB", i * 4),
+                );
+            }
         }
+
+        sleep(Duration::from_millis(50)).await;
     }
 
-    if ok {
-        ("OK".to_string(), "".to_string())
+    let alive_str = if alive { "Да" } else { "Нет" };
+    (alive_str.to_string(), "OK".to_string(), "".to_string())
+}
+
+async fn probe_tcp_target(target: &TcpTarget, timeout_dur: Duration) -> (String, String, String) {
+    let addr = format!("{}:{}", target.ip, target.port);
+    let tcp = match timeout(timeout_dur, TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(_)) => return ("Нет".to_string(), "ERR".to_string(), "connect_error".to_string()),
+        Err(_) => return ("Нет".to_string(), "ERR".to_string(), "timeout".to_string()),
+    };
+
+    if target.port == 443 {
+        let sni_host = if !target.sni.trim().is_empty() {
+            target.sni.clone()
+        } else {
+            "example.com".to_string()
+        };
+        let server_name = match ServerName::try_from(sni_host.clone()) {
+            Ok(n) => n,
+            Err(_) => return ("Нет".to_string(), "ERR".to_string(), "invalid_sni".to_string()),
+        };
+        let connector = build_dangerous_tls_connector();
+        let mut tls_stream = match timeout(timeout_dur, connector.connect(server_name, tcp)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(_)) => return ("Нет".to_string(), "ERR".to_string(), "tls_handshake_error".to_string()),
+            Err(_) => return ("Нет".to_string(), "ERR".to_string(), "tls_handshake_timeout".to_string()),
+        };
+        run_fat_sequence(&mut tls_stream, &sni_host, timeout_dur).await
     } else {
-        ("MIXED".to_string(), "partial_timeout".to_string())
+        let host = if !target.sni.trim().is_empty() {
+            target.sni.clone()
+        } else {
+            target.ip.clone()
+        };
+        let mut plain_stream = tcp;
+        run_fat_sequence(&mut plain_stream, &host, timeout_dur).await
     }
 }
 
@@ -592,8 +741,8 @@ pub async fn run_tcp_check(cfg: &AppConfig, targets: &[TcpTarget]) -> TcpStats {
         let timeout_dur = Duration::from_secs(8);
         async move {
             let _permit = sem.acquire().await.ok();
-            let (status, detail) = probe_tcp_target(&target, timeout_dur).await;
-            (target, status, detail)
+            let (alive, status, detail) = probe_tcp_target(&target, timeout_dur).await;
+            (target, alive, status, detail)
         }
     });
 
@@ -609,8 +758,8 @@ pub async fn run_tcp_check(cfg: &AppConfig, targets: &[TcpTarget]) -> TcpStats {
     let mut raw_rows = Vec::with_capacity(rows.len());
 
     render_section_title("[Проверка TCP 16-20KB]", targets.len(), Duration::from_secs(8));
-    let mut table_rows: Vec<(String, String, String, String, String)> = Vec::with_capacity(rows.len());
-    for (target, status, detail) in rows {
+    let mut table_rows: Vec<(String, String, String, String, String, String)> = Vec::with_capacity(rows.len());
+    for (target, alive, status, detail) in rows {
         let status_key = if status == "OK" {
             ok += 1;
             "ok"
@@ -626,6 +775,7 @@ pub async fn run_tcp_check(cfg: &AppConfig, targets: &[TcpTarget]) -> TcpStats {
             target.id.clone(),
             asn_value.clone(),
             target.provider.clone(),
+            alive.clone(),
             status.clone(),
             if detail.is_empty() { "-".to_string() } else { detail.clone() },
         ));
@@ -642,6 +792,7 @@ pub async fn run_tcp_check(cfg: &AppConfig, targets: &[TcpTarget]) -> TcpStats {
             target.id,
             asn_value,
             target.provider,
+            alive,
             status,
             detail,
         ]);
@@ -650,13 +801,13 @@ pub async fn run_tcp_check(cfg: &AppConfig, targets: &[TcpTarget]) -> TcpStats {
     table_rows.sort_by(|a, b| a.0.cmp(&b.0));
     let rows_fmt = table_rows
         .into_iter()
-        .map(|(id, asn, provider, status, detail)| vec![id, asn, provider, status, detail])
+        .map(|(id, asn, provider, alive, status, detail)| vec![id, asn, provider, alive, status, detail])
         .collect::<Vec<_>>();
     draw_table(
-        &["ID", "ASN", "Провайдер", "Статус", "Детали"],
+        &["ID", "ASN", "Провайдер", "Alive", "Статус", "Детали"],
         &rows_fmt,
-        &[3],
         &[4],
+        &[5],
     );
 
     println!("[tcp] total={total} ok={ok} blocked={blocked} mixed={mixed}");
@@ -696,7 +847,7 @@ pub async fn run_whitelist_sni_test(cfg: &AppConfig, targets: &[TcpTarget], whit
     for target in &port443 {
         let timeout_dur = Duration::from_secs(8);
         let base = probe_tcp_target(target, timeout_dur).await;
-        if base.0 == "DETECTED" {
+        if base.1 == "DETECTED" {
             let key = if target.asn.trim().is_empty() {
                 target.ip.clone()
             } else {
@@ -726,7 +877,7 @@ pub async fn run_whitelist_sni_test(cfg: &AppConfig, targets: &[TcpTarget], whit
             let _permit = sem.acquire().await.ok();
             let mut t = target.clone();
             t.sni = sni.clone();
-            let (status, _) = probe_tcp_target(&t, Duration::from_secs(8)).await;
+            let (_alive, status, _detail) = probe_tcp_target(&t, Duration::from_secs(8)).await;
             if status == "OK" {
                 selected = if sni.is_empty() { "(без SNI)".to_string() } else { sni };
                 break;
