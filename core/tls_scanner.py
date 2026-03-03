@@ -127,16 +127,17 @@ async def _check_tls_single(
                     content_len = 0
 
                 if 0 < content_len < config.BODY_INSPECT_LIMIT:
-                    body = b""
+                    body = bytearray()
                     try:
                         async for chunk in response.aiter_bytes(chunk_size=128):
-                            body += chunk
+                            body.extend(chunk)
+                            bytes_read += len(chunk)
                             if len(body) >= config.BODY_INSPECT_LIMIT:
                                 break
                     except Exception:
                         pass
 
-                    body_text = body.decode("utf-8", errors="ignore").lower()
+                    body_text = bytes(body).decode("utf-8", errors="ignore").lower()
                     if any(m in body_text for m in config.BODY_BLOCK_MARKERS):
                         await response.aclose()
                         return ("[bold red]ISP PAGE[/bold red]", "Блок-страница в теле", len(body), elapsed)
@@ -230,17 +231,17 @@ async def check_http_injection(
             return ("[bold red]ISP PAGE[/bold red]", "Блок-страница")
 
         if 200 <= status_code < 300:
-            body = b""
+            body = bytearray()
             try:
                 async for chunk in response.aiter_bytes(chunk_size=128):
-                    body += chunk
+                    body.extend(chunk)
                     if len(body) >= config.BODY_INSPECT_LIMIT:
                         break
             except Exception:
                 pass
             await response.aclose()
 
-            body_text = body.decode("utf-8", errors="ignore").lower()
+            body_text = bytes(body).decode("utf-8", errors="ignore").lower()
             if any(m in body_text for m in config.BODY_BLOCK_MARKERS):
                 return ("[bold red]ISP PAGE[/bold red]", "Блок-страница (HTTP)")
             return ("[green]OK[/green]", f"{status_code}")

@@ -1,6 +1,7 @@
 from typing import Optional, List, Dict
 import asyncio
 import ctypes
+import gc
 import os
 import sys
 import traceback
@@ -354,6 +355,9 @@ async def main():
     first_run = True
     while True:
         await run_tests(selection, semaphore)
+
+        # Явно освобождаем неиспользуемые объекты между прогонами.
+        gc.collect()
 
         # Возвращаем освобождённые страницы glibc ядру, чтобы снизить RES
         # в фазе ожидания между прогонами (~120 МБ → ~40–50 МБ).

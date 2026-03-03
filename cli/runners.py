@@ -112,28 +112,46 @@ async def _tcp16_worker(item: dict, semaphore: asyncio.Semaphore) -> list:
 
 # ── Хелпер прогресс-бара ─────────────────────────────────────────────────────
 
-async def _run_with_progress(tasks: list, description: str) -> list:
-    results = []
-    total = len(tasks)
+async def _run_bounded_with_progress(items: list, worker, description: str, collect_results: bool = True):
+    """Запускает задачи с ограничением in-flight, чтобы не раздувать RAM."""
+    total = len(items)
+    if total == 0:
+        return [] if collect_results else None
+
+    in_flight_limit = max(1, min(config.MAX_CONCURRENT, total))
+    results = [None] * total if collect_results else None
+    next_idx = 0
+    done_count = 0
+    in_flight: dict = {}
+
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
         task_id = progress.add_task(description, total=total)
-        for future in asyncio.as_completed(tasks):
-            result = await future
-            results.append(result)
-            done = len(results)
-            progress.update(task_id, completed=done, description=f"{description} ({done}/{total})...")
-    return results
+        try:
+            while done_count < total:
+                while next_idx < total and len(in_flight) < in_flight_limit:
+                    task = asyncio.create_task(worker(items[next_idx]))
+                    in_flight[task] = next_idx
+                    next_idx += 1
 
+                if not in_flight:
+                    break
 
-async def _run_phase_with_progress(tasks: list, description: str) -> None:
-    total = len(tasks)
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
-        task_id = progress.add_task(description, total=total)
-        completed = 0
-        for future in asyncio.as_completed(tasks):
-            await future
-            completed += 1
-            progress.update(task_id, completed=completed, description=f"{description} ({completed}/{total})...")
+                done_tasks, _ = await asyncio.wait(in_flight.keys(), return_when=asyncio.FIRST_COMPLETED)
+                for task in done_tasks:
+                    idx = in_flight.pop(task)
+                    result = await task
+                    if collect_results:
+                        results[idx] = result
+                    done_count += 1
+                    progress.update(task_id, completed=done_count, description=f"{description} ({done_count}/{total})...")
+        finally:
+            for task in in_flight:
+                if not task.done():
+                    task.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight.keys(), return_exceptions=True)
+
+    return results if collect_results else None
 
 
 def _classify_domain_status(row: list, stub_ips: set) -> dict:
@@ -191,10 +209,15 @@ async def run_domains_test(semaphore: asyncio.Semaphore, stub_ips: set, domains:
     table.add_column("TLS1.3",  justify="center")
     table.add_column("Детали",  style="dim", no_wrap=True)
 
-    # Фаза 0: DNS-резолв
-    entries = await _run_with_progress(
-        [_resolve_worker(d, semaphore, stub_ips) for d in domains],
-        "Фаза 0/3: DNS-резолв..."
+    async def _resolve_item(domain: str):
+        return await _resolve_worker(domain, semaphore, stub_ips)
+
+    # Фаза 0: DNS-резолв (bounded)
+    entries = await _run_bounded_with_progress(
+        domains,
+        _resolve_item,
+        "Фаза 0/3: DNS-резолв...",
+        collect_results=True,
     )
 
     client_t13 = create_dpi_client("TLSv1.3")
@@ -202,17 +225,32 @@ async def run_domains_test(semaphore: asyncio.Semaphore, stub_ips: set, domains:
     client_http = create_dpi_client()
 
     try:
-        await _run_phase_with_progress(
-            [_tls_worker(e, client_t13, "t13v4_res", semaphore) for e in entries],
-            "Фаза 1/3: TLS 1.3..."
+        async def _tls13_item(entry: dict):
+            await _tls_worker(entry, client_t13, "t13v4_res", semaphore)
+
+        async def _tls12_item(entry: dict):
+            await _tls_worker(entry, client_t12, "t12_res", semaphore)
+
+        async def _http_item(entry: dict):
+            await _http_worker(entry, client_http, semaphore)
+
+        await _run_bounded_with_progress(
+            entries,
+            _tls13_item,
+            "Фаза 1/3: TLS 1.3...",
+            collect_results=False,
         )
-        await _run_phase_with_progress(
-            [_tls_worker(e, client_t12, "t12_res", semaphore) for e in entries],
-            "Фаза 2/3: TLS 1.2..."
+        await _run_bounded_with_progress(
+            entries,
+            _tls12_item,
+            "Фаза 2/3: TLS 1.2...",
+            collect_results=False,
         )
-        await _run_phase_with_progress(
-            [_http_worker(e, client_http, semaphore) for e in entries],
-            "Фаза 3/3: HTTP..."
+        await _run_bounded_with_progress(
+            entries,
+            _http_item,
+            "Фаза 3/3: HTTP...",
+            collect_results=False,
         )
     finally:
         await client_t13.aclose()
@@ -279,9 +317,14 @@ async def run_tcp_test(semaphore: asyncio.Semaphore, tcp_items: list) -> dict:
     table.add_column("Статус",    justify="center")
     table.add_column("Детали",    style="dim")
 
-    tcp_results = await _run_with_progress(
-        [_tcp16_worker(item, semaphore) for item in tcp_items],
-        "Проверка..."
+    async def _tcp_item(item: dict):
+        return await _tcp16_worker(item, semaphore)
+
+    tcp_results = await _run_bounded_with_progress(
+        tcp_items,
+        _tcp_item,
+        "Проверка...",
+        collect_results=True,
     )
 
     def _provider_group(provider_str: str) -> str:
@@ -393,9 +436,11 @@ async def run_whitelist_sni_test(semaphore: asyncio.Semaphore, tcp_items: list, 
             "rtt":     rtt,
         }
 
-    base_rows = await _run_with_progress(
-        [_base_worker(item) for item in port443_items],
+    base_rows = await _run_bounded_with_progress(
+        port443_items,
+        _base_worker,
         "Фаза 1/2: Базовая проверка...",
+        collect_results=True,
     )
 
     # Для каждой AS выбираем DETECTED IP с наименьшим RTT

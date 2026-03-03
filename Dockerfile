@@ -4,6 +4,8 @@ WORKDIR /app
 
 # Оптимизация потребления памяти для Python (glibc)
 ENV MALLOC_ARENA_MAX=2
+ENV PYTHONMALLOC=malloc
+ENV MALLOC_TRIM_THRESHOLD_=131072
 # Отключение буферизации вывода
 ENV PYTHONUNBUFFERED=1
 # Запрет на создание .pyc файлов
@@ -35,6 +37,8 @@ ENV RUN_MODE=schedule
 ENV TESTS=123
 ENV CHECK_INTERVAL=7200
 ENV METRICS_PORT=9090
+ENV MAX_CONCURRENT=30
+ENV BODY_INSPECT_LIMIT=4096
 # ENV METRICS_USER=prometheus
 # ENV METRICS_PASSWORD=secret
 

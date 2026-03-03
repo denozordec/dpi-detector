@@ -4,8 +4,25 @@ import sys
 Конфигурация DPI Detector
 """
 
+def _env_int(name: str, default: int, min_value: int = 1, max_value: int = 10_000) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        if value < min_value:
+            return min_value
+        if value > max_value:
+            return max_value
+        return value
+    except Exception:
+        return default
+
+
 # === Основные настройки ===
-MAX_CONCURRENT = 100
+# Через env можно опустить параллелизм под слабую VPS:
+#   MAX_CONCURRENT=30
+MAX_CONCURRENT = _env_int("MAX_CONCURRENT", 100, min_value=1, max_value=2000)
 
 # === Таймауты ===
 TIMEOUT = 7.0
@@ -18,7 +35,10 @@ FAT_CONNECT_TIMEOUT = 8.0
 FAT_READ_TIMEOUT = 12.0
 
 # === Отображение ===
-BODY_INSPECT_LIMIT = 8192
+# Ограничение чтения тела ответа (байты), влияет на RAM.
+# Через env:
+#   BODY_INSPECT_LIMIT=4096
+BODY_INSPECT_LIMIT = _env_int("BODY_INSPECT_LIMIT", 8192, min_value=512, max_value=1_048_576)
 
 # === User Agent ===
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"

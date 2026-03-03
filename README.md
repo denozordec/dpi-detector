@@ -51,6 +51,8 @@
 | `METRICS_PORT` | порт | `9090` | Порт Prometheus-метрик |
 | `METRICS_USER` | строка | — | Basic Auth логин для метрик |
 | `METRICS_PASSWORD` | строка | — | Basic Auth пароль для метрик |
+| `MAX_CONCURRENT` | число | `30` (Docker) | Лимит параллельных запросов (ниже = меньше RAM, но медленнее) |
+| `BODY_INSPECT_LIMIT` | байты | `4096` (Docker) | Лимит чтения тела HTTP/TLS для детекта блок-страниц |
 
 ---
 
