@@ -4,9 +4,6 @@ use crate::metrics::{
     set_domain_statuses, set_last_run_now, set_metric, set_tcp_target_statuses, DomainStatus, SharedMetrics,
     TcpTargetStatus,
 };
-use comfy_table::{
-    modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Color, ContentArrangement, Table,
-};
 use futures::stream::{self, StreamExt};
 use hickory_resolver::config::*;
 use hickory_resolver::TokioAsyncResolver;
@@ -54,12 +51,12 @@ struct DohResponse {
     answer: Option<Vec<DohAnswer>>,
 }
 
-fn status_cell(value: &str) -> Cell {
+fn color_status(value: &str) -> &'static str {
     let upper = value.to_uppercase();
     if upper.contains("OK") || upper.contains("REDIR") {
-        Cell::new(value).fg(Color::Green).add_attribute(Attribute::Bold)
+        "\x1b[1;32m"
     } else if upper.contains("TIMEOUT") || upper.contains("MIXED") {
-        Cell::new(value).fg(Color::Yellow).add_attribute(Attribute::Bold)
+        "\x1b[1;33m"
     } else if upper.contains("BLOCK")
         || upper.contains("DETECTED")
         || upper.contains("RST")
@@ -68,15 +65,88 @@ fn status_cell(value: &str) -> Cell {
         || upper.contains("DNS FAKE")
         || upper.contains("ISP PAGE")
     {
-        Cell::new(value).fg(Color::Red).add_attribute(Attribute::Bold)
+        "\x1b[1;31m"
     } else {
-        Cell::new(value).fg(Color::White)
+        "\x1b[0m"
     }
+}
+
+fn pad_cell(value: &str, width: usize) -> String {
+    let len = value.chars().count();
+    if len >= width {
+        value.to_string()
+    } else {
+        format!("{value}{}", " ".repeat(width - len))
+    }
+}
+
+fn draw_line(widths: &[usize], left: &str, mid: &str, right: &str, fill: &str) {
+    let mut line = String::from(left);
+    for (i, w) in widths.iter().enumerate() {
+        line.push_str(&fill.repeat(*w + 2));
+        if i + 1 == widths.len() {
+            line.push_str(right);
+        } else {
+            line.push_str(mid);
+        }
+    }
+    println!("{line}");
+}
+
+fn draw_table(headers: &[&str], rows: &[Vec<String>], status_cols: &[usize], dim_cols: &[usize]) {
+    if headers.is_empty() {
+        return;
+    }
+    let mut widths = headers.iter().map(|h| h.chars().count()).collect::<Vec<_>>();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+
+    draw_line(&widths, "┌", "┬", "┐", "─");
+    let mut header = String::from("│");
+    for (i, h) in headers.iter().enumerate() {
+        header.push(' ');
+        header.push_str("\x1b[1;35m");
+        header.push_str(&pad_cell(h, widths[i]));
+        header.push_str("\x1b[0m");
+        header.push(' ');
+        header.push('│');
+    }
+    println!("{header}");
+    draw_line(&widths, "├", "┼", "┤", "─");
+
+    for row in rows {
+        let mut line = String::from("│");
+        for (i, cell) in row.iter().enumerate() {
+            line.push(' ');
+            if status_cols.contains(&i) {
+                line.push_str(color_status(cell));
+                line.push_str(&pad_cell(cell, widths[i]));
+                line.push_str("\x1b[0m");
+            } else if dim_cols.contains(&i) {
+                line.push_str("\x1b[2m");
+                line.push_str(&pad_cell(cell, widths[i]));
+                line.push_str("\x1b[0m");
+            } else if i == 0 {
+                line.push_str("\x1b[36m");
+                line.push_str(&pad_cell(cell, widths[i]));
+                line.push_str("\x1b[0m");
+            } else {
+                line.push_str(&pad_cell(cell, widths[i]));
+            }
+            line.push(' ');
+            line.push('│');
+        }
+        println!("{line}");
+    }
+    draw_line(&widths, "└", "┴", "┘", "─");
 }
 
 fn render_section_title(title: &str, total: usize, timeout: Duration) {
     println!(
-        "\n{}  Целей: {} | timeout: {:.1}s",
+        "\n\x1b[1m{}\x1b[0m  Целей: {} | timeout: {:.1}s",
         title,
         total,
         timeout.as_secs_f32()
@@ -267,26 +337,11 @@ pub async fn run_dns_check(cfg: &AppConfig) -> (HashSet<String>, i64, i64) {
         .filter_map(|(ip, c)| if c >= 2 { Some(ip) } else { None })
         .collect::<HashSet<_>>();
 
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            Cell::new("Домен").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("DoH").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("UDP DNS").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("Статус").fg(Color::Magenta).add_attribute(Attribute::Bold),
-        ]);
-    for (domain, doh, udp, status) in rows {
-        table.add_row(vec![
-            Cell::new(domain).fg(Color::Cyan),
-            Cell::new(doh).fg(Color::White),
-            Cell::new(udp).fg(Color::White),
-            status_cell(&status),
-        ]);
-    }
-    println!("{table}");
+    let table_rows = rows
+        .into_iter()
+        .map(|(domain, doh, udp, status)| vec![domain, doh, udp, status])
+        .collect::<Vec<_>>();
+    draw_table(&["Домен", "DoH", "UDP DNS", "Статус"], &table_rows, &[3], &[]);
     println!("[dns] intercepted {intercepted}/{total}");
     (stubs, intercepted, total)
 }
@@ -475,28 +530,16 @@ pub async fn run_domains_check(cfg: &AppConfig, domains: &[String], stub_ips: &H
     }
 
     view_rows.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            Cell::new("Домен").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("HTTP").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("TLS1.2").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("TLS1.3").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("Детали").fg(Color::Magenta).add_attribute(Attribute::Bold),
-        ]);
-    for (domain, http, tls12, tls13, detail) in view_rows {
-        table.add_row(vec![
-            Cell::new(domain).fg(Color::Cyan),
-            status_cell(&http),
-            status_cell(&tls12),
-            status_cell(&tls13),
-            Cell::new(detail).fg(Color::DarkGrey),
-        ]);
-    }
-    println!("{table}");
+    let table_rows = view_rows
+        .into_iter()
+        .map(|(domain, http, tls12, tls13, detail)| vec![domain, http, tls12, tls13, detail])
+        .collect::<Vec<_>>();
+    draw_table(
+        &["Домен", "HTTP", "TLS1.2", "TLS1.3", "Детали"],
+        &table_rows,
+        &[1, 2, 3],
+        &[4],
+    );
 
     println!(
         "[domains] total={total} ok={ok} blocked={blocked} timeout={timeout_cnt} dns_fail={dns_fail}"
@@ -605,28 +648,16 @@ pub async fn run_tcp_check(cfg: &AppConfig, targets: &[TcpTarget]) -> TcpStats {
     }
 
     table_rows.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            Cell::new("ID").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("ASN").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("Провайдер").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("Статус").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("Детали").fg(Color::Magenta).add_attribute(Attribute::Bold),
-        ]);
-    for (id, asn, provider, status, detail) in table_rows {
-        table.add_row(vec![
-            Cell::new(id).fg(Color::White),
-            Cell::new(asn).fg(Color::Yellow),
-            Cell::new(provider).fg(Color::Cyan),
-            status_cell(&status),
-            Cell::new(detail).fg(Color::DarkGrey),
-        ]);
-    }
-    println!("{table}");
+    let rows_fmt = table_rows
+        .into_iter()
+        .map(|(id, asn, provider, status, detail)| vec![id, asn, provider, status, detail])
+        .collect::<Vec<_>>();
+    draw_table(
+        &["ID", "ASN", "Провайдер", "Статус", "Детали"],
+        &rows_fmt,
+        &[3],
+        &[4],
+    );
 
     println!("[tcp] total={total} ok={ok} blocked={blocked} mixed={mixed}");
     TcpStats {
@@ -711,24 +742,11 @@ pub async fn run_whitelist_sni_test(cfg: &AppConfig, targets: &[TcpTarget], whit
     }
 
     rows.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            Cell::new("AS").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("Провайдер").fg(Color::Magenta).add_attribute(Attribute::Bold),
-            Cell::new("WL SNI").fg(Color::Magenta).add_attribute(Attribute::Bold),
-        ]);
-    for (asn, provider, wl_sni) in rows {
-        table.add_row(vec![
-            Cell::new(asn).fg(Color::Yellow),
-            Cell::new(provider).fg(Color::Cyan),
-            status_cell(&wl_sni),
-        ]);
-    }
-    println!("{table}");
+    let rows_fmt = rows
+        .into_iter()
+        .map(|(asn, provider, wl_sni)| vec![asn, provider, wl_sni])
+        .collect::<Vec<_>>();
+    draw_table(&["AS", "Провайдер", "WL SNI"], &rows_fmt, &[2], &[]);
 
     println!("[sni] Найдено белых SNI: {found}/{total}");
 }
