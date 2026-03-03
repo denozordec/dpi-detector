@@ -21,6 +21,10 @@ fn base_dir() -> Result<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 требует явного process-level провайдера криптографии.
+    // Фиксирует стабильное поведение в контейнере и убирает panic при старте.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cfg = AppConfig::from_env();
     let mode_label = match cfg.run_mode {
         RunMode::Once => "once",
